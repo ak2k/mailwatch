@@ -1,0 +1,156 @@
+[project]
+name = "mailwatch"
+version = "0.1.0"
+description = "Self-hosted USPS Intelligent Mail barcode generator and letter tracker"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [
+    { name = "Adam Kirby" },
+]
+keywords = ["usps", "imb", "intelligent-mail-barcode", "mail", "tracking", "envelope"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Email",
+    "Framework :: FastAPI",
+]
+dependencies = [
+    "fastapi>=0.136,<1",
+    "uvicorn>=0.32,<1",
+    "gunicorn>=23.0,<24",
+    "httpx>=0.28,<1",
+    "tenacity>=9.0,<10",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "jinja2>=3.1,<4",
+    "itsdangerous>=2.2,<3",
+    "reportlab>=4.2,<5",
+    "pylabels2>=1.4.4,<2",
+    "python-multipart>=0.0.19,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/ak2k/mailwatch"
+Issues = "https://github.com/ak2k/mailwatch/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.24,<1",
+    "pytest-cov>=6.0,<7",
+    "asgi-lifespan>=2.1,<3",
+    "ruff>=0.8,<0.9",
+    "mypy>=1.13,<2",
+    "pre-commit>=4.0,<5",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.0,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv", "result", "result-*", "_generated"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "N", "UP", "B", "SIM", "C4",
+    "PIE", "PTH", "ASYNC", "RUF", "S", "TID", "PL",
+]
+ignore = [
+    "E501",
+    "B008",
+    "SIM108",
+    "PLR0913",
+    "RUF012",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106", "PLR2004", "ARG", "D"]
+"conftest.py" = ["S101"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mailwatch"]
+combine-as-imports = true
+
+[tool.ruff.lint.pep8-naming]
+classmethod-decorators = ["classmethod", "pydantic.validator", "pydantic.field_validator"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+warn_unreachable = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+strict_equality = true
+extra_checks = true
+disallow_any_generics = false
+disallow_subclassing_any = false
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[[tool.mypy.overrides]]
+module = ["reportlab.*", "pylabels.*", "labels.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--showlocals",
+    "--cov=mailwatch",
+    "--cov-report=term-missing:skip-covered",
+    "--cov-report=xml",
+]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:reportlab.*",
+    "ignore::pydantic.PydanticDeprecatedSince20",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: tests that hit external services",
+]
+
+[tool.coverage.run]
+source = ["mailwatch"]
+branch = true
+omit = ["tests/*", "mailwatch/_generated/*", "mailwatch/__main__.py"]
+
+[tool.coverage.report]
+precision = 1
+show_missing = true
+fail_under = 75
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "\\.\\.\\.",
+    "@overload",
+]

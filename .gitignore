@@ -1,0 +1,56 @@
+# Environment / secrets — never commit real values
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# Build
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Test / coverage artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+pytest.xml
+mypy.xml
+junit.xml
+
+# Nix
+result
+result-*
+
+# SQLite (local dev DBs)
+*.db
+*.db-wal
+*.db-shm
+
+# Generated PDFs (test artifacts, local previews)
+*.pdf
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# uv
+.uv/

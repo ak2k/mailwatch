@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked --group dev
+      - run: uv run ruff check --output-format=github .
+      - run: uv run ruff format --check .
+      - run: uv run mypy --junit-xml mypy.xml mailwatch
+      - if: always()
+        uses: mikepenz/action-junit-report@v4
+        with:
+          report_paths: mypy.xml
+          check_name: mypy
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked --group dev
+      - run: uv run pytest --cov=mailwatch --cov-report=xml --junitxml=pytest.xml
+      - if: always()
+        uses: mikepenz/action-junit-report@v4
+        with:
+          report_paths: pytest.xml
+          check_name: pytest
+      - uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
