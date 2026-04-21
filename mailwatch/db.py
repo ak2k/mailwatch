@@ -13,8 +13,16 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
+
+# USPS IV-MTR scan event codes treated as "delivered" for poll-gating purposes.
+# Conservative list — if we miss one, the worst case is polling a delivered
+# letter once per 30 min (cheap). Source: USPS IV-MTR MPE scan code reference.
+# "01" is the long-standing "delivered" code for letter mail; additional codes
+# can be added here without schema migration.
+DELIVERED_SCAN_CODES: frozenset[str] = frozenset({"01"})
 
 SCHEMA = """\
 CREATE TABLE IF NOT EXISTS app_state (
@@ -171,6 +179,67 @@ def get_scan_events(conn: sqlite3.Connection, imb: str) -> list[dict[str, Any]]:
             }
         )
     return result
+
+
+def get_in_flight_imbs(conn: sqlite3.Connection, lookback_days: int = 14) -> list[str]:
+    """Return distinct IMbs with a scan_event in the last ``lookback_days``.
+
+    Excludes IMbs whose *latest* scan (by ``created_at``, tiebreaking on
+    ``event_id`` for determinism) indicates delivery — specifically, whose
+    latest event's ``event_json`` decodes to a dict with a ``scanEventCode``
+    (or ``scan_event_code``) in :data:`DELIVERED_SCAN_CODES`.
+
+    If decoding fails or no scan code is present the event is treated as
+    non-delivery (conservative: we'd rather over-poll than drop a letter).
+
+    The SQL groups the recent window by IMb and uses a correlated subquery to
+    pick out the per-IMb latest row; delivery-code filtering happens in Python
+    because ``event_json`` is an opaque BLOB and we don't want to trust SQLite
+    JSON1 being present on every build.
+    """
+    cutoff = int(time.time()) - lookback_days * 86400
+    rows = conn.execute(
+        """
+        SELECT se.imb, se.event_json
+        FROM scan_events se
+        WHERE se.created_at >= ?
+          AND se.created_at = (
+              SELECT MAX(s2.created_at)
+              FROM scan_events s2
+              WHERE s2.imb = se.imb
+          )
+          AND se.event_id = (
+              SELECT MAX(s3.event_id)
+              FROM scan_events s3
+              WHERE s3.imb = se.imb
+                AND s3.created_at = se.created_at
+          )
+        """,
+        (cutoff,),
+    ).fetchall()
+
+    result: list[str] = []
+    for imb, event_json in rows:
+        if _is_delivered_payload(event_json):
+            continue
+        result.append(imb)
+    return result
+
+
+def _is_delivered_payload(event_json: bytes | str | None) -> bool:
+    """Return True if the decoded scan payload indicates delivery."""
+    if not event_json:
+        return False
+    try:
+        payload = json.loads(event_json)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    code = payload.get("scanEventCode") or payload.get("scan_event_code")
+    if not isinstance(code, str):
+        return False
+    return code in DELIVERED_SCAN_CODES
 
 
 # --- address cache -----------------------------------------------------------

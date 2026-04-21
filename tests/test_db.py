@@ -221,6 +221,96 @@ def test_purge_old_on_empty_tables(conn: sqlite3.Connection) -> None:
     assert deleted == {"scan_events": 0, "serial_counters": 0, "address_cache": 0}
 
 
+# --- in-flight IMbs ---------------------------------------------------------
+
+
+def _insert_scan(
+    conn: sqlite3.Connection,
+    event_id: str,
+    imb: str,
+    event_json: bytes,
+    age_seconds: int,
+) -> None:
+    """Helper: insert a scan_events row with ``created_at = now - age_seconds``."""
+    conn.execute(
+        "INSERT INTO scan_events (event_id, imb, event_json, scan_datetime, created_at) "
+        "VALUES (?, ?, ?, NULL, unixepoch() - ?)",
+        (event_id, imb, event_json, age_seconds),
+    )
+
+
+def test_in_flight_empty_db(conn: sqlite3.Connection) -> None:
+    assert db.get_in_flight_imbs(conn) == []
+
+
+def test_in_flight_one_recent_non_delivered(conn: sqlite3.Connection) -> None:
+    _insert_scan(conn, "e1", "imb-A", b'{"scanEventCode":"SD"}', age_seconds=60)
+    assert db.get_in_flight_imbs(conn) == ["imb-A"]
+
+
+def test_in_flight_delivered_is_excluded(conn: sqlite3.Connection) -> None:
+    _insert_scan(conn, "e1", "imb-A", b'{"scanEventCode":"01"}', age_seconds=60)
+    assert db.get_in_flight_imbs(conn) == []
+
+
+def test_in_flight_stale_outside_window(conn: sqlite3.Connection) -> None:
+    # 30 days old is outside the default 14-day window.
+    _insert_scan(conn, "e1", "imb-A", b'{"scanEventCode":"SD"}', age_seconds=30 * 86400)
+    assert db.get_in_flight_imbs(conn) == []
+
+
+def test_in_flight_honours_lookback_days(conn: sqlite3.Connection) -> None:
+    # 10 days old: outside a 7-day window but inside the default 14-day window.
+    _insert_scan(conn, "e1", "imb-A", b'{"scanEventCode":"SD"}', age_seconds=10 * 86400)
+    assert db.get_in_flight_imbs(conn, lookback_days=7) == []
+    assert db.get_in_flight_imbs(conn, lookback_days=14) == ["imb-A"]
+
+
+def test_in_flight_latest_event_is_authoritative(conn: sqlite3.Connection) -> None:
+    # Older in-transit scan; newer delivery scan → IMb is delivered, exclude.
+    _insert_scan(conn, "old", "imb-A", b'{"scanEventCode":"SD"}', age_seconds=2 * 86400)
+    _insert_scan(conn, "new", "imb-A", b'{"scanEventCode":"01"}', age_seconds=60)
+    assert db.get_in_flight_imbs(conn) == []
+
+
+def test_in_flight_latest_non_delivered_wins_over_old_delivered(
+    conn: sqlite3.Connection,
+) -> None:
+    # Weird case (shouldn't happen in practice), but proves "latest" drives the
+    # decision: an old "delivered" row followed by a newer "in transit" row
+    # means the IMb is treated as still in flight.
+    _insert_scan(conn, "old", "imb-A", b'{"scanEventCode":"01"}', age_seconds=2 * 86400)
+    _insert_scan(conn, "new", "imb-A", b'{"scanEventCode":"SD"}', age_seconds=60)
+    assert db.get_in_flight_imbs(conn) == ["imb-A"]
+
+
+def test_in_flight_mixed_imbs(conn: sqlite3.Connection) -> None:
+    _insert_scan(conn, "a1", "imb-A", b'{"scanEventCode":"SD"}', age_seconds=60)
+    _insert_scan(conn, "b1", "imb-B", b'{"scanEventCode":"01"}', age_seconds=60)
+    _insert_scan(conn, "c1", "imb-C", b'{"scanEventCode":"SD"}', age_seconds=30 * 86400)
+    result = set(db.get_in_flight_imbs(conn))
+    assert result == {"imb-A"}
+
+
+def test_in_flight_malformed_payload_treated_as_non_delivery(
+    conn: sqlite3.Connection,
+) -> None:
+    _insert_scan(conn, "e1", "imb-A", b"not-json", age_seconds=60)
+    assert db.get_in_flight_imbs(conn) == ["imb-A"]
+
+
+def test_in_flight_payload_without_scan_code_treated_as_non_delivery(
+    conn: sqlite3.Connection,
+) -> None:
+    _insert_scan(conn, "e1", "imb-A", b'{"foo":"bar"}', age_seconds=60)
+    assert db.get_in_flight_imbs(conn) == ["imb-A"]
+
+
+def test_in_flight_snake_case_scan_code_also_recognised(conn: sqlite3.Connection) -> None:
+    _insert_scan(conn, "e1", "imb-A", b'{"scan_event_code":"01"}', age_seconds=60)
+    assert db.get_in_flight_imbs(conn) == []
+
+
 def test_purge_old_honors_custom_ttls(conn: sqlite3.Connection) -> None:
     # A 10-day-old scan event is NOT stale at 60d default but IS stale at 5d.
     conn.execute(
