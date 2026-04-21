@@ -224,7 +224,7 @@ in
       after = [ "network.target" "mailwatch.service" ];
       environment = {
         DB_PATH = dbPath;
-        MAILWATCH_POLL_LOOKBACK_DAYS = toString cfg.poll.lookbackDays;
+        POLL_LOOKBACK_DAYS = toString cfg.poll.lookbackDays;
       };
       serviceConfig = hardening // {
         Type = "oneshot";
