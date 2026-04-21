@@ -14,9 +14,9 @@
   <fieldset>
     <legend>Sender</legend>
     <div class="field">
-      <label for="sender">Return address</label>
-      <textarea id="sender" name="sender" rows="4" required
-                placeholder="One line per row (name, street, city/state/zip)"></textarea>
+      <label for="sender_address">Return address</label>
+      <textarea id="sender_address" name="sender_address" rows="4" required
+                placeholder="One line per row (name, street, city/state/zip)">{{ sender_address or "" }}</textarea>
     </div>
   </fieldset>
 
@@ -39,8 +39,8 @@
     </div>
 
     <div class="field">
-      <label for="recipient_unit">Apt / suite / floor <span class="muted">(optional)</span></label>
-      <input type="text" id="recipient_unit" name="recipient_unit">
+      <label for="recipient_address2">Apt / suite / floor <span class="muted">(optional)</span></label>
+      <input type="text" id="recipient_address2" name="recipient_address2">
     </div>
 
     <div class="grid-3">
@@ -103,23 +103,23 @@
     <legend>Output format</legend>
     <div class="field radios">
       <label class="radio">
-        <input type="radio" name="format" value="envelope" checked>
+        <input type="radio" name="format_type" value="envelope" checked>
         #10 envelope
       </label>
       <label class="radio">
-        <input type="radio" name="format" value="avery8163">
+        <input type="radio" name="format_type" value="avery">
         Avery 8163 label sheet
       </label>
     </div>
 
     <div id="avery-options" class="grid-2" hidden>
       <div class="field">
-        <label for="start_row">Start row</label>
-        <input type="number" id="start_row" name="start_row" min="1" max="5" value="1">
+        <label for="row">Start row</label>
+        <input type="number" id="row" name="row" min="1" max="5" value="1">
       </div>
       <div class="field">
-        <label for="start_col">Start column</label>
-        <input type="number" id="start_col" name="start_col" min="1" max="2" value="1">
+        <label for="col">Start column</label>
+        <input type="number" id="col" name="col" min="1" max="2" value="1">
       </div>
     </div>
   </fieldset>
@@ -144,12 +144,12 @@
 {% block scripts %}
 <script>
   (function () {
-    var formatRadios = document.querySelectorAll('input[name="format"]');
+    var formatRadios = document.querySelectorAll('input[name="format_type"]');
     var averyOpts = document.getElementById('avery-options');
 
     function syncAvery() {
-      var selected = document.querySelector('input[name="format"]:checked');
-      if (selected && selected.value === 'avery8163') {
+      var selected = document.querySelector('input[name="format_type"]:checked');
+      if (selected && selected.value === 'avery') {
         averyOpts.hidden = false;
       } else {
         averyOpts.hidden = true;
@@ -165,13 +165,12 @@
 
     validateBtn.addEventListener('click', function () {
       var payload = {
-        name: document.getElementById('recipient_name').value,
-        company: document.getElementById('recipient_company').value,
-        street: document.getElementById('recipient_street').value,
-        unit: document.getElementById('recipient_unit').value,
+        firm: document.getElementById('recipient_company').value,
+        streetAddress: document.getElementById('recipient_street').value,
+        secondaryAddress: document.getElementById('recipient_address2').value,
         city: document.getElementById('recipient_city').value,
         state: document.getElementById('recipient_state').value,
-        zip: document.getElementById('recipient_zip').value
+        ZIPCode: document.getElementById('recipient_zip').value
       };
 
       validateResult.hidden = false;
@@ -196,11 +195,10 @@
         var lines = [];
         if (r.data.standardized) {
           var s = r.data.standardized;
-          if (s.street) { lines.push(s.street); }
-          if (s.unit) { lines.push(s.unit); }
-          if (s.city || s.state || s.zip) {
-            lines.push([s.city, s.state, s.zip].filter(Boolean).join(' '));
-          }
+          if (s.streetAddress) { lines.push(s.streetAddress); }
+          if (s.secondaryAddress) { lines.push(s.secondaryAddress); }
+          var tail = [s.city, s.state, s.full_zip || s.ZIPCode].filter(Boolean).join(' ');
+          if (tail) { lines.push(tail); }
         }
         validateResult.textContent = 'Standardized: ' + lines.join(' / ');
       }).catch(function (err) {
