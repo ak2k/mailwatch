@@ -1,0 +1,47 @@
+name: Renovate
+
+on:
+  schedule:
+    # Every 4h. Renovate's own schedule: rules in renovate.json decide
+    # which PRs actually open on each run; running the workflow often
+    # just means "check for new upstream releases faster".
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: Log level (debug, info, warn)
+        required: false
+        default: info
+      overrideSchedule:
+        description: Ignore schedule from renovate.json (y/n)
+        required: false
+        default: 'n'
+
+concurrency:
+  group: renovate
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  renovate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - uses: renovatebot/github-action@v46.1.9
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          LOG_LEVEL: ${{ inputs.logLevel || 'info' }}
+          RENOVATE_REPOSITORIES: ${{ github.repository }}
+          RENOVATE_FORCE: ${{ inputs.overrideSchedule == 'y' && '{"schedule":null}' || '' }}

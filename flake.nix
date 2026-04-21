@@ -109,6 +109,18 @@
             mypy mailwatch
             touch $out
           '';
+          nix-statix = pkgs.runCommand "mailwatch-nix-statix" { nativeBuildInputs = [ pkgs.statix ]; } ''
+            statix check ${./.}
+            touch $out
+          '';
+          nix-fmt = pkgs.runCommand "mailwatch-nix-fmt" { nativeBuildInputs = [ pkgs.nixfmt-rfc-style ]; } ''
+            nixfmt --check ${./flake.nix} ${./nix/module.nix}
+            touch $out
+          '';
+          nix-deadnix = pkgs.runCommand "mailwatch-nix-deadnix" { nativeBuildInputs = [ pkgs.deadnix ]; } ''
+            deadnix --fail ${./flake.nix} ${./nix/module.nix}
+            touch $out
+          '';
         }
       );
 
