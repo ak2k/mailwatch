@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+
+{% block title %}mailwatch &middot; track a letter{% endblock %}
+
+{% block content %}
+<h1>Track a letter</h1>
+<p>
+  Enter the tracking serial and recipient ZIP you saved when generating the
+  envelope. Scan events will stream in as USPS processes the mailpiece.
+</p>
+
+<form id="track-form" class="stack">
+  <div class="grid-2">
+    <div class="field">
+      <label for="serial">Tracking serial</label>
+      <input type="text" id="serial" name="serial"
+             pattern="\d+" inputmode="numeric" required
+             value="{{ serial if serial is not none else '' }}">
+    </div>
+
+    <div class="field">
+      <label for="zip">Recipient ZIP</label>
+      <input type="text" id="zip" name="zip"
+             pattern="\d{5}(-?\d{4})?" inputmode="numeric" required
+             value="{{ recipient_zip if recipient_zip else '' }}">
+    </div>
+  </div>
+
+  <div class="field actions">
+    <button type="submit" class="primary">Track</button>
+  </div>
+</form>
+
+<section class="stack">
+  <h2>Status</h2>
+  <p id="status" class="status status-idle">Idle. Submit the form above to connect.</p>
+
+  <h2>Scan events</h2>
+  <p id="empty-notice" class="muted">
+    No scan events yet. Letters typically take 2&ndash;5 days to show their first scan.
+  </p>
+  <ul id="scans" class="scans" aria-live="polite"></ul>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function () {
+    var form = document.getElementById('track-form');
+    var serialInput = document.getElementById('serial');
+    var zipInput = document.getElementById('zip');
+    var statusEl = document.getElementById('status');
+    var scansEl = document.getElementById('scans');
+    var emptyNotice = document.getElementById('empty-notice');
+
+    var ws = null;
+    var receivedAny = false;
+
+    function setStatus(text, cls) {
+      statusEl.textContent = text;
+      statusEl.className = 'status ' + cls;
+    }
+
+    function fmt(ts) {
+      if (!ts) { return ''; }
+      try {
+        var d = new Date(ts);
+        if (isNaN(d.getTime())) { return String(ts); }
+        return d.toLocaleString();
+      } catch (e) {
+        return String(ts);
+      }
+    }
+
+    function prependScan(scan) {
+      receivedAny = true;
+      emptyNotice.hidden = true;
+
+      var li = document.createElement('li');
+      li.className = 'scan';
+
+      var when = document.createElement('time');
+      when.className = 'scan-time';
+      if (scan.timestamp) {
+        when.dateTime = scan.timestamp;
+      }
+      when.textContent = fmt(scan.timestamp);
+
+      var what = document.createElement('span');
+      what.className = 'scan-event';
+      what.textContent = scan.event || scan.description || 'Scan';
+
+      var where = document.createElement('span');
+      where.className = 'scan-location';
+      if (scan.location) {
+        where.textContent = scan.location;
+      }
+
+      li.appendChild(when);
+      li.appendChild(document.createTextNode(' — '));
+      li.appendChild(what);
+      if (scan.location) {
+        li.appendChild(document.createTextNode(' @ '));
+        li.appendChild(where);
+      }
+
+      scansEl.insertBefore(li, scansEl.firstChild);
+    }
+
+    function connect(serial, zip) {
+      if (ws) {
+        try { ws.close(); } catch (e) { /* ignore */ }
+        ws = null;
+      }
+      scansEl.innerHTML = '';
+      receivedAny = false;
+      emptyNotice.hidden = false;
+
+      var proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      var url = proto + '//' + window.location.host + '/track-ws';
+      setStatus('Connecting...', 'status-connecting');
+
+      try {
+        ws = new WebSocket(url);
+      } catch (err) {
+        setStatus('Could not open WebSocket: ' + err, 'status-error');
+        return;
+      }
+
+      ws.addEventListener('open', function () {
+        setStatus('Connected. Waiting for scans...', 'status-connected');
+        ws.send(JSON.stringify({ receipt_zip: zip, serial: serial }));
+      });
+
+      ws.addEventListener('message', function (ev) {
+        var data;
+        try {
+          data = JSON.parse(ev.data);
+        } catch (err) {
+          setStatus('Malformed message from server.', 'status-error');
+          return;
+        }
+        if (data.error) {
+          setStatus('Error: ' + data.error, 'status-error');
+          return;
+        }
+        if (Array.isArray(data.scans)) {
+          data.scans.forEach(prependScan);
+          if (receivedAny) {
+            setStatus('Receiving scans. Leave the tab open for updates.', 'status-connected');
+          }
+        }
+      });
+
+      ws.addEventListener('close', function () {
+        setStatus('Disconnected. Submit the form to reconnect.', 'status-closed');
+      });
+
+      ws.addEventListener('error', function () {
+        setStatus('Connection error. Submit the form to retry.', 'status-error');
+      });
+    }
+
+    form.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      var serial = serialInput.value.trim();
+      var zip = zipInput.value.trim();
+      if (!serial || !zip) {
+        setStatus('Serial and ZIP are required.', 'status-error');
+        return;
+      }
+      connect(serial, zip);
+    });
+
+    // Auto-connect if both fields are prefilled.
+    if (serialInput.value && zipInput.value) {
+      connect(serialInput.value.trim(), zipInput.value.trim());
+    }
+  })();
+</script>
+{% endblock %}

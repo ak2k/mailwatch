@@ -1,0 +1,213 @@
+{% extends "base.html" %}
+
+{% block title %}mailwatch &middot; generate envelope{% endblock %}
+
+{% block content %}
+<h1>Generate a tracked envelope</h1>
+<p>
+  Fill in sender and recipient addresses, then download a print-ready PDF
+  with a USPS Intelligent Mail barcode. Scans will appear on the
+  <a href="/tracking">tracking page</a> once USPS processes the letter.
+</p>
+
+<form id="generate-form" action="/generate" method="post" class="stack">
+  <fieldset>
+    <legend>Sender</legend>
+    <div class="field">
+      <label for="sender">Return address</label>
+      <textarea id="sender" name="sender" rows="4" required
+                placeholder="One line per row (name, street, city/state/zip)"></textarea>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Recipient</legend>
+
+    <div class="field">
+      <label for="recipient_name">Name</label>
+      <input type="text" id="recipient_name" name="recipient_name" required>
+    </div>
+
+    <div class="field">
+      <label for="recipient_company">Company / firm <span class="muted">(optional)</span></label>
+      <input type="text" id="recipient_company" name="recipient_company">
+    </div>
+
+    <div class="field">
+      <label for="recipient_street">Street address</label>
+      <input type="text" id="recipient_street" name="recipient_street" required>
+    </div>
+
+    <div class="field">
+      <label for="recipient_unit">Apt / suite / floor <span class="muted">(optional)</span></label>
+      <input type="text" id="recipient_unit" name="recipient_unit">
+    </div>
+
+    <div class="grid-3">
+      <div class="field">
+        <label for="recipient_city">City</label>
+        <input type="text" id="recipient_city" name="recipient_city" required>
+      </div>
+
+      <div class="field">
+        <label for="recipient_state">State</label>
+        <select id="recipient_state" name="recipient_state" required>
+          <option value="" disabled selected>--</option>
+          <option value="AL">AL</option><option value="AK">AK</option>
+          <option value="AZ">AZ</option><option value="AR">AR</option>
+          <option value="CA">CA</option><option value="CO">CO</option>
+          <option value="CT">CT</option><option value="DE">DE</option>
+          <option value="DC">DC</option><option value="FL">FL</option>
+          <option value="GA">GA</option><option value="HI">HI</option>
+          <option value="ID">ID</option><option value="IL">IL</option>
+          <option value="IN">IN</option><option value="IA">IA</option>
+          <option value="KS">KS</option><option value="KY">KY</option>
+          <option value="LA">LA</option><option value="ME">ME</option>
+          <option value="MD">MD</option><option value="MA">MA</option>
+          <option value="MI">MI</option><option value="MN">MN</option>
+          <option value="MS">MS</option><option value="MO">MO</option>
+          <option value="MT">MT</option><option value="NE">NE</option>
+          <option value="NV">NV</option><option value="NH">NH</option>
+          <option value="NJ">NJ</option><option value="NM">NM</option>
+          <option value="NY">NY</option><option value="NC">NC</option>
+          <option value="ND">ND</option><option value="OH">OH</option>
+          <option value="OK">OK</option><option value="OR">OR</option>
+          <option value="PA">PA</option><option value="RI">RI</option>
+          <option value="SC">SC</option><option value="SD">SD</option>
+          <option value="TN">TN</option><option value="TX">TX</option>
+          <option value="UT">UT</option><option value="VT">VT</option>
+          <option value="VA">VA</option><option value="WA">WA</option>
+          <option value="WV">WV</option><option value="WI">WI</option>
+          <option value="WY">WY</option>
+          <option value="AS">AS</option><option value="GU">GU</option>
+          <option value="MP">MP</option><option value="PR">PR</option>
+          <option value="VI">VI</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="recipient_zip">ZIP</label>
+        <input type="text" id="recipient_zip" name="recipient_zip"
+               pattern="\d{5}(-?\d{4})?" required
+               inputmode="numeric" autocomplete="postal-code">
+      </div>
+    </div>
+
+    <div class="field">
+      <button type="button" id="validate-btn">Validate address</button>
+      <div id="validate-result" class="validate-result" hidden></div>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Output format</legend>
+    <div class="field radios">
+      <label class="radio">
+        <input type="radio" name="format" value="envelope" checked>
+        #10 envelope
+      </label>
+      <label class="radio">
+        <input type="radio" name="format" value="avery8163">
+        Avery 8163 label sheet
+      </label>
+    </div>
+
+    <div id="avery-options" class="grid-2" hidden>
+      <div class="field">
+        <label for="start_row">Start row</label>
+        <input type="number" id="start_row" name="start_row" min="1" max="5" value="1">
+      </div>
+      <div class="field">
+        <label for="start_col">Start column</label>
+        <input type="number" id="start_col" name="start_col" min="1" max="2" value="1">
+      </div>
+    </div>
+  </fieldset>
+
+  <div class="field actions">
+    <button type="submit" class="primary">Generate</button>
+  </div>
+</form>
+
+<hr>
+
+<section>
+  <h2>Already have a tracking number?</h2>
+  <p>
+    If you generated an envelope earlier and want to see scan events,
+    jump to the <a href="/tracking">tracking page</a>.
+  </p>
+  <p><a class="button-link" href="/tracking">Track a letter</a></p>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function () {
+    var formatRadios = document.querySelectorAll('input[name="format"]');
+    var averyOpts = document.getElementById('avery-options');
+
+    function syncAvery() {
+      var selected = document.querySelector('input[name="format"]:checked');
+      if (selected && selected.value === 'avery8163') {
+        averyOpts.hidden = false;
+      } else {
+        averyOpts.hidden = true;
+      }
+    }
+    formatRadios.forEach(function (r) {
+      r.addEventListener('change', syncAvery);
+    });
+    syncAvery();
+
+    var validateBtn = document.getElementById('validate-btn');
+    var validateResult = document.getElementById('validate-result');
+
+    validateBtn.addEventListener('click', function () {
+      var payload = {
+        name: document.getElementById('recipient_name').value,
+        company: document.getElementById('recipient_company').value,
+        street: document.getElementById('recipient_street').value,
+        unit: document.getElementById('recipient_unit').value,
+        city: document.getElementById('recipient_city').value,
+        state: document.getElementById('recipient_state').value,
+        zip: document.getElementById('recipient_zip').value
+      };
+
+      validateResult.hidden = false;
+      validateResult.className = 'validate-result';
+      validateResult.textContent = 'Validating...';
+
+      fetch('/validate_address', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }).then(function (resp) {
+        return resp.json().then(function (data) {
+          return { ok: resp.ok, data: data };
+        });
+      }).then(function (r) {
+        if (!r.ok || r.data.error) {
+          validateResult.className = 'validate-result error';
+          validateResult.textContent = r.data.error || 'Validation failed.';
+          return;
+        }
+        validateResult.className = 'validate-result ok';
+        var lines = [];
+        if (r.data.standardized) {
+          var s = r.data.standardized;
+          if (s.street) { lines.push(s.street); }
+          if (s.unit) { lines.push(s.unit); }
+          if (s.city || s.state || s.zip) {
+            lines.push([s.city, s.state, s.zip].filter(Boolean).join(' '));
+          }
+        }
+        validateResult.textContent = 'Standardized: ' + lines.join(' / ');
+      }).catch(function (err) {
+        validateResult.className = 'validate-result error';
+        validateResult.textContent = 'Network error: ' + err;
+      });
+    });
+  })();
+</script>
+{% endblock %}
