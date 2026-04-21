@@ -96,7 +96,7 @@ async def _run_poll(
     for imb in in_flight:
         try:
             resp = await ivmtr.get_tracking(imb)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — one IMb's failure must not abort the whole poll pass
             log.warning("poll: get_tracking failed for %s: %s", imb, exc)
             error_count += 1
             continue
@@ -126,7 +126,7 @@ def main() -> int:
     )
     settings = get_settings()
     try:
-        result = asyncio.run(_poll_once(settings))
+        result = asyncio.run(_poll_once(settings, lookback_days=settings.POLL_LOOKBACK_DAYS))
     except Exception:
         log.exception("poll pass failed")
         return 1

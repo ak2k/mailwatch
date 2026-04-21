@@ -448,7 +448,7 @@ def test_main_returns_zero_on_success(settings: Settings, monkeypatch: pytest.Mo
     pytest-asyncio (which leaks file descriptors into the next test's setup).
     """
 
-    async def _fake(_settings: Settings) -> dict[str, int]:
+    async def _fake(_settings: Settings, **_kwargs: object) -> dict[str, int]:
         return {"polled": 0, "new_events": 0, "errors": 0}
 
     captured: list[dict[str, int]] = []
@@ -478,7 +478,7 @@ def test_main_returns_one_on_unhandled_exception(
 ) -> None:
     """An unhandled exception propagates to a non-zero exit code, not a crash."""
 
-    async def _boom(_settings: Settings) -> dict[str, int]:
+    async def _boom(_settings: Settings, **_kwargs: object) -> dict[str, int]:
         raise RuntimeError("simulated pass failure")
 
     def _fake_run(coro: object) -> dict[str, int]:
@@ -496,3 +496,50 @@ def test_main_returns_one_on_unhandled_exception(
     monkeypatch.setattr(poll, "_poll_once", _boom)
     monkeypatch.setattr(poll.asyncio, "run", _fake_run)
     assert poll.main() == 1
+
+
+def test_main_respects_mailwatch_poll_lookback_days_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``POLL_LOOKBACK_DAYS`` must flow env → Settings → main → _poll_once.
+
+    Regression fence: if Settings.POLL_LOOKBACK_DAYS or main()'s wiring is
+    removed, the NixOS module's Environment= setting becomes silently dead.
+    """
+    db_path = tmp_path / "mailwatch.db"
+    monkeypatch.setenv("MAILER_ID", "123456")
+    monkeypatch.setenv("BSG_USERNAME", "u")
+    monkeypatch.setenv("BSG_PASSWORD", "p")
+    monkeypatch.setenv("USPS_NEWAPI_CUSTOMER_ID", "c")
+    monkeypatch.setenv("USPS_NEWAPI_CUSTOMER_SECRET", "s")
+    monkeypatch.setenv("SESSION_KEY", "a" * 32)
+    monkeypatch.setenv("DB_PATH", str(db_path))
+    monkeypatch.setenv("POLL_LOOKBACK_DAYS", "1")
+    get_settings.cache_clear()
+
+    captured: list[int] = []
+
+    async def _capture(
+        _settings: Settings, *, lookback_days: int, **_kwargs: object
+    ) -> dict[str, int]:
+        captured.append(lookback_days)
+        return {"polled": 0, "new_events": 0, "errors": 0}
+
+    def _fake_run(coro: object) -> dict[str, int]:
+        import asyncio as _asyncio
+
+        loop = _asyncio.new_event_loop()
+        try:
+            result: dict[str, int] = loop.run_until_complete(
+                cast("object", coro)  # type: ignore[arg-type]
+            )
+        finally:
+            loop.close()
+        return result
+
+    monkeypatch.setattr(poll, "_poll_once", _capture)
+    monkeypatch.setattr(poll.asyncio, "run", _fake_run)
+
+    assert poll.main() == 0
+    assert captured == [1]
+    get_settings.cache_clear()

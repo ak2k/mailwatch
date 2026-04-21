@@ -70,7 +70,7 @@ async def _token_refresh_loop(app: FastAPI) -> None:
         ):
             try:
                 await coro
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — one client's failure must not kill the refresh loop
                 logger.warning("token refresh (%s) failed: %s", name, exc)
 
 

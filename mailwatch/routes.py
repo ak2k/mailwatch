@@ -385,7 +385,7 @@ async def post_validate_address(
     """
     try:
         result = await client.validate_address(payload)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — USPS errors must surface as 502, not crash the handler
         logger.warning("address validation failed: %s", exc)
         return JSONResponse({"error": str(exc)}, status_code=502)
 
@@ -465,7 +465,7 @@ async def track_ws(websocket: WebSocket) -> None:
 
             try:
                 live = await ivmtr.get_tracking(imb_key)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — live-pull failure falls back to stored events
                 logger.info("IV-MTR live pull failed: %s", exc)
                 live = None
 

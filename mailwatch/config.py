@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     # Rate limiting
     RATE_LIMIT_PER_HOUR: int = Field(50, ge=1, le=10000)
 
+    # IV-MTR pull-poll daemon (read by `python -m mailwatch.poll`)
+    POLL_LOOKBACK_DAYS: int = Field(14, ge=1, le=365)
+
     # IV-MTR push feed source IP allowlist.
     # ``NoDecode`` disables pydantic-settings' default JSON-decoding for list
     # fields so the string form from env (``"a,b,c"``) reaches the
