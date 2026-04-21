@@ -194,6 +194,16 @@ def _canonical_address_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def hash_address_dict(d: dict[str, Any]) -> str:
+    """Return the canonical cache-key hash for an address-request dict.
+
+    Public wrapper around :func:`_canonical_address_hash` so clients can
+    reuse the same normalisation (sort keys, strip + upper-case strings)
+    without importing a private helper.
+    """
+    return _canonical_address_hash(d)
+
+
 def cache_get(conn: sqlite3.Connection, input_hash: str) -> bytes | None:
     """Return cached response bytes for ``input_hash``, or None."""
     row = conn.execute(
