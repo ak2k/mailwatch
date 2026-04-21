@@ -57,20 +57,28 @@
           devEnv = s.pythonSet.mkVirtualEnv "mailwatch-env-dev" s.workspace.deps.all;
         in
         {
+          # Python tooling caches must point at the sandbox-writable $TMPDIR;
+          # the source tree `cd`-d into is a read-only /nix/store path.
           tests = pkgs.runCommand "mailwatch-tests" { nativeBuildInputs = [ devEnv ]; } ''
-            cd ${./.}
+            cp -r ${./.}/. .
+            chmod -R u+w .
             export HOME=$TMPDIR
+            export PYTEST_CACHE_DIR=$TMPDIR/.pytest_cache
             pytest
             touch $out
           '';
           lint = pkgs.runCommand "mailwatch-lint" { nativeBuildInputs = [ devEnv ]; } ''
-            cd ${./.}
+            cp -r ${./.}/. .
+            chmod -R u+w .
+            export RUFF_CACHE_DIR=$TMPDIR/.ruff_cache
             ruff check .
             ruff format --check .
             touch $out
           '';
           typecheck = pkgs.runCommand "mailwatch-typecheck" { nativeBuildInputs = [ devEnv ]; } ''
-            cd ${./.}
+            cp -r ${./.}/. .
+            chmod -R u+w .
+            export MYPY_CACHE_DIR=$TMPDIR/.mypy_cache
             mypy mailwatch
             touch $out
           '';
