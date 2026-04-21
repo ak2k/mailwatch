@@ -15,9 +15,9 @@
 
 { config, lib, pkgs, mailwatchPackage }:
 
-with lib;
-
 let
+  inherit (lib) mkIf mkOption mkEnableOption types literalExpression concatStringsSep;
+
   cfg = config.services.mailwatch;
 
   dbPath = "${cfg.stateDir}/mailwatch.db";
@@ -170,7 +170,7 @@ in
       group = cfg.group;
       home = cfg.stateDir;
       createHome = false;
-      shell = "/run/current-system/sw/bin/nologin";
+      # isSystemUser already blocks interactive login; no explicit shell needed.
     };
     users.groups.${cfg.group} = { };
 
@@ -188,12 +188,15 @@ in
       };
       serviceConfig = hardening // {
         Type = "notify";
+        NotifyAccess = "main";
         KillMode = "mixed";
+        KillSignal = "SIGTERM";
         TimeoutStopSec = 30;
         User = cfg.user;
         Group = cfg.group;
         StateDirectory = "mailwatch";
         StateDirectoryMode = "0770";
+        RuntimeDirectory = "mailwatch";
         EnvironmentFile = cfg.environmentFile;
         UMask = "0007";
         ReadWritePaths = [ cfg.stateDir ];
@@ -202,11 +205,15 @@ in
           "--workers ${toString cfg.workers}"
           "--worker-class uvicorn.workers.UvicornWorker"
           "--bind ${cfg.bindAddress}:${toString cfg.bindPort}"
+          "--forwarded-allow-ips 127.0.0.1"
+          "--graceful-timeout 30"
+          "--timeout 60"
           "--access-logfile -"
           "--error-logfile -"
           "mailwatch.app:app"
         ];
-        Restart = "always";
+        ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
+        Restart = "on-failure";
         RestartSec = 5;
       };
     };
