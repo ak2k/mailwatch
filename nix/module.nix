@@ -13,10 +13,22 @@
 #     environmentFile = "/run/secrets/mailwatch.env";
 #   };
 
-{ config, lib, pkgs, mailwatchPackage }:
+{
+  config,
+  lib,
+  pkgs,
+  mailwatchPackage,
+}:
 
 let
-  inherit (lib) mkIf mkOption mkEnableOption types literalExpression concatStringsSep;
+  inherit (lib)
+    mkIf
+    mkOption
+    mkEnableOption
+    types
+    literalExpression
+    concatStringsSep
+    ;
 
   cfg = config.services.mailwatch;
 
@@ -45,14 +57,23 @@ let
     ProtectHostname = true;
     ProtectClock = true;
     RestrictNamespaces = true;
-    RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
+    RestrictAddressFamilies = [
+      "AF_UNIX"
+      "AF_INET"
+      "AF_INET6"
+    ];
     RestrictRealtime = true;
     RestrictSUIDSGID = true;
     LockPersonality = true;
     CapabilityBoundingSet = "";
     AmbientCapabilities = "";
     SystemCallArchitectures = "native";
-    SystemCallFilter = [ "@system-service" "@resources" "~@privileged" "@chown" ];
+    SystemCallFilter = [
+      "@system-service"
+      "@resources"
+      "~@privileged"
+      "@chown"
+    ];
   };
 in
 {
@@ -167,116 +188,125 @@ in
   config = mkIf cfg.enable {
     users.users.${cfg.user} = {
       isSystemUser = true;
-      group = cfg.group;
+      inherit (cfg) group;
       home = cfg.stateDir;
       createHome = false;
       # isSystemUser already blocks interactive login; no explicit shell needed.
     };
     users.groups.${cfg.group} = { };
 
-    systemd.tmpfiles.rules = [
-      "d ${cfg.stateDir} 0770 ${cfg.user} ${cfg.group} -"
-    ];
+    systemd = {
+      tmpfiles.rules = [
+        "d ${cfg.stateDir} 0770 ${cfg.user} ${cfg.group} -"
+      ];
 
-    # --- Main web service (gunicorn + UvicornWorker) ---
-    systemd.services.mailwatch = {
-      description = "mailwatch — USPS IMb letter tracker (web)";
-      after = [ "network.target" ];
-      wantedBy = [ "multi-user.target" ];
-      environment = {
-        DB_PATH = dbPath;
-      };
-      serviceConfig = hardening // {
-        Type = "notify";
-        NotifyAccess = "main";
-        KillMode = "mixed";
-        KillSignal = "SIGTERM";
-        TimeoutStopSec = 30;
-        User = cfg.user;
-        Group = cfg.group;
-        StateDirectory = "mailwatch";
-        StateDirectoryMode = "0770";
-        RuntimeDirectory = "mailwatch";
-        EnvironmentFile = cfg.environmentFile;
-        UMask = "0007";
-        ReadWritePaths = [ cfg.stateDir ];
-        ExecStart = concatStringsSep " " [
-          "${cfg.package}/bin/gunicorn"
-          "--workers ${toString cfg.workers}"
-          "--worker-class uvicorn.workers.UvicornWorker"
-          "--bind ${cfg.bindAddress}:${toString cfg.bindPort}"
-          "--forwarded-allow-ips 127.0.0.1"
-          "--graceful-timeout 30"
-          "--timeout 60"
-          "--access-logfile -"
-          "--error-logfile -"
-          "mailwatch.app:app"
-        ];
-        ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
-        Restart = "on-failure";
-        RestartSec = 5;
-      };
-    };
+      services = {
+        # Main web service (gunicorn + UvicornWorker).
+        mailwatch = {
+          description = "mailwatch — USPS IMb letter tracker (web)";
+          after = [ "network.target" ];
+          wantedBy = [ "multi-user.target" ];
+          environment = {
+            DB_PATH = dbPath;
+          };
+          serviceConfig = hardening // {
+            Type = "notify";
+            NotifyAccess = "main";
+            KillMode = "mixed";
+            KillSignal = "SIGTERM";
+            TimeoutStopSec = 30;
+            User = cfg.user;
+            Group = cfg.group;
+            StateDirectory = "mailwatch";
+            StateDirectoryMode = "0770";
+            RuntimeDirectory = "mailwatch";
+            EnvironmentFile = cfg.environmentFile;
+            UMask = "0007";
+            ReadWritePaths = [ cfg.stateDir ];
+            ExecStart = concatStringsSep " " [
+              "${cfg.package}/bin/gunicorn"
+              "--workers ${toString cfg.workers}"
+              "--worker-class uvicorn.workers.UvicornWorker"
+              "--bind ${cfg.bindAddress}:${toString cfg.bindPort}"
+              "--forwarded-allow-ips 127.0.0.1"
+              "--graceful-timeout 30"
+              "--timeout 60"
+              "--access-logfile -"
+              "--error-logfile -"
+              "mailwatch.app:app"
+            ];
+            ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
+            Restart = "on-failure";
+            RestartSec = 5;
+          };
+        };
 
-    # --- IV-MTR pull poller (optional) ---
-    systemd.services.mailwatch-poll = mkIf cfg.poll.enable {
-      description = "mailwatch — IV-MTR pull poll";
-      after = [ "network.target" "mailwatch.service" ];
-      environment = {
-        DB_PATH = dbPath;
-        POLL_LOOKBACK_DAYS = toString cfg.poll.lookbackDays;
-      };
-      serviceConfig = hardening // {
-        Type = "oneshot";
-        User = cfg.user;
-        Group = cfg.group;
-        StateDirectory = "mailwatch";
-        StateDirectoryMode = "0770";
-        EnvironmentFile = cfg.environmentFile;
-        UMask = "0007";
-        ReadWritePaths = [ cfg.stateDir ];
-        ExecStart = "${cfg.package}/bin/python -m mailwatch.poll";
-      };
-    };
+        # IV-MTR pull poller (optional).
+        mailwatch-poll = mkIf cfg.poll.enable {
+          description = "mailwatch — IV-MTR pull poll";
+          after = [
+            "network.target"
+            "mailwatch.service"
+          ];
+          environment = {
+            DB_PATH = dbPath;
+            POLL_LOOKBACK_DAYS = toString cfg.poll.lookbackDays;
+          };
+          serviceConfig = hardening // {
+            Type = "oneshot";
+            User = cfg.user;
+            Group = cfg.group;
+            StateDirectory = "mailwatch";
+            StateDirectoryMode = "0770";
+            EnvironmentFile = cfg.environmentFile;
+            UMask = "0007";
+            ReadWritePaths = [ cfg.stateDir ];
+            ExecStart = "${cfg.package}/bin/python -m mailwatch.poll";
+          };
+        };
 
-    systemd.timers.mailwatch-poll = mkIf cfg.poll.enable {
-      description = "mailwatch — trigger IV-MTR poll";
-      wantedBy = [ "timers.target" ];
-      timerConfig = {
-        OnBootSec = "5min";
-        OnUnitActiveSec = cfg.poll.interval;
-        Persistent = true;
-        Unit = "mailwatch-poll.service";
+        # Periodic cleanup (optional, default on).
+        mailwatch-cleanup = mkIf cfg.cleanup.enable {
+          description = "mailwatch — prune old scan events and expired sessions";
+          environment = {
+            DB_PATH = dbPath;
+          };
+          serviceConfig = hardening // {
+            Type = "oneshot";
+            User = cfg.user;
+            Group = cfg.group;
+            StateDirectory = "mailwatch";
+            StateDirectoryMode = "0770";
+            EnvironmentFile = cfg.environmentFile;
+            UMask = "0007";
+            ReadWritePaths = [ cfg.stateDir ];
+            ExecStart = "${cfg.package}/bin/python -m mailwatch.cleanup";
+          };
+        };
       };
-    };
 
-    # --- Periodic cleanup (optional, default on) ---
-    systemd.services.mailwatch-cleanup = mkIf cfg.cleanup.enable {
-      description = "mailwatch — prune old scan events and expired sessions";
-      environment = {
-        DB_PATH = dbPath;
-      };
-      serviceConfig = hardening // {
-        Type = "oneshot";
-        User = cfg.user;
-        Group = cfg.group;
-        StateDirectory = "mailwatch";
-        StateDirectoryMode = "0770";
-        EnvironmentFile = cfg.environmentFile;
-        UMask = "0007";
-        ReadWritePaths = [ cfg.stateDir ];
-        ExecStart = "${cfg.package}/bin/python -m mailwatch.cleanup";
-      };
-    };
+      timers = {
+        mailwatch-poll = mkIf cfg.poll.enable {
+          description = "mailwatch — trigger IV-MTR poll";
+          wantedBy = [ "timers.target" ];
+          timerConfig = {
+            OnBootSec = "5min";
+            OnUnitActiveSec = cfg.poll.interval;
+            Persistent = true;
+            Unit = "mailwatch-poll.service";
+          };
+        };
 
-    systemd.timers.mailwatch-cleanup = mkIf cfg.cleanup.enable {
-      description = "mailwatch — run cleanup on a schedule";
-      wantedBy = [ "timers.target" ];
-      timerConfig = {
-        OnCalendar = cfg.cleanup.schedule;
-        Persistent = true;
-        RandomizedDelaySec = "30min";
-        Unit = "mailwatch-cleanup.service";
+        mailwatch-cleanup = mkIf cfg.cleanup.enable {
+          description = "mailwatch — run cleanup on a schedule";
+          wantedBy = [ "timers.target" ];
+          timerConfig = {
+            OnCalendar = cfg.cleanup.schedule;
+            Persistent = true;
+            RandomizedDelaySec = "30min";
+            Unit = "mailwatch-cleanup.service";
+          };
+        };
       };
     };
 

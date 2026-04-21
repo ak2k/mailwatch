@@ -9,23 +9,41 @@
     };
     uv2nix = {
       url = "github:pyproject-nix/uv2nix";
-      inputs.pyproject-nix.follows = "pyproject-nix";
-      inputs.nixpkgs.follows = "nixpkgs";
+      inputs = {
+        pyproject-nix.follows = "pyproject-nix";
+        nixpkgs.follows = "nixpkgs";
+      };
     };
     pyproject-build-systems = {
       url = "github:pyproject-nix/build-system-pkgs";
-      inputs.pyproject-nix.follows = "pyproject-nix";
-      inputs.uv2nix.follows = "uv2nix";
-      inputs.nixpkgs.follows = "nixpkgs";
+      inputs = {
+        pyproject-nix.follows = "pyproject-nix";
+        uv2nix.follows = "uv2nix";
+        nixpkgs.follows = "nixpkgs";
+      };
     };
   };
 
-  outputs = { self, nixpkgs, pyproject-nix, uv2nix, pyproject-build-systems, ... }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      pyproject-nix,
+      uv2nix,
+      pyproject-build-systems,
+      ...
+    }:
     let
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
 
-      mkPythonSet = system:
+      mkPythonSet =
+        system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
           workspace = uv2nix.lib.workspace.loadWorkspace { workspaceRoot = ./.; };
@@ -33,24 +51,33 @@
         in
         {
           inherit workspace;
-          pythonSet = (pkgs.callPackage pyproject-nix.build.packages {
-            python = pkgs.python312;
-          }).overrideScope (nixpkgs.lib.composeManyExtensions [
-            pyproject-build-systems.overlays.wheel
-            overlay
-          ]);
+          pythonSet =
+            (pkgs.callPackage pyproject-nix.build.packages {
+              python = pkgs.python312;
+            }).overrideScope
+              (
+                nixpkgs.lib.composeManyExtensions [
+                  pyproject-build-systems.overlays.wheel
+                  overlay
+                ]
+              );
         };
     in
     {
-      packages = forAllSystems (system:
-        let s = mkPythonSet system; in
+      packages = forAllSystems (
+        system:
+        let
+          s = mkPythonSet system;
+        in
         {
           default = s.pythonSet.mkVirtualEnv "mailwatch-env" s.workspace.deps.default;
           mailwatch = s.pythonSet.mkVirtualEnv "mailwatch-env" s.workspace.deps.default;
           mailwatch-dev = s.pythonSet.mkVirtualEnv "mailwatch-env-dev" s.workspace.deps.all;
-        });
+        }
+      );
 
-      checks = forAllSystems (system:
+      checks = forAllSystems (
+        system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
           s = mkPythonSet system;
@@ -82,9 +109,11 @@
             mypy mailwatch
             touch $out
           '';
-        });
+        }
+      );
 
-      devShells = forAllSystems (system:
+      devShells = forAllSystems (
+        system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
           s = mkPythonSet system;
@@ -92,15 +121,25 @@
         in
         {
           default = pkgs.mkShell {
-            packages = [ devEnv pkgs.uv ];
+            packages = [
+              devEnv
+              pkgs.uv
+            ];
             shellHook = ''
               export UV_NO_SYNC=1
               export UV_PYTHON="${devEnv}/bin/python"
             '';
           };
-        });
+        }
+      );
 
-      nixosModules.mailwatch = { config, lib, pkgs, ... }:
+      nixosModules.mailwatch =
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
         import ./nix/module.nix {
           inherit config lib pkgs;
           mailwatchPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.mailwatch;
