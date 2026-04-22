@@ -16,6 +16,7 @@
     <div class="field">
       <label for="sender_address">Return address</label>
       <textarea id="sender_address" name="sender_address" rows="4" required
+                maxlength="1000"
                 placeholder="One line per row (name, street, city/state/zip)">{{ sender_address or "" }}</textarea>
     </div>
   </fieldset>
@@ -26,24 +27,28 @@
     <div class="field">
       <label for="recipient_name">Name</label>
       <input type="text" id="recipient_name" name="recipient_name" required
+             maxlength="500"
              value="{{ (recipient.name if recipient else '') or '' }}">
     </div>
 
     <div class="field">
       <label for="recipient_company">Company / firm <span class="muted">(optional)</span></label>
       <input type="text" id="recipient_company" name="recipient_company"
+             maxlength="500"
              value="{{ (recipient.company if recipient else '') or '' }}">
     </div>
 
     <div class="field">
       <label for="recipient_street">Street address</label>
       <input type="text" id="recipient_street" name="recipient_street" required
+             maxlength="500"
              value="{{ (recipient.street if recipient else '') or '' }}">
     </div>
 
     <div class="field">
       <label for="recipient_address2">Apt / suite / floor <span class="muted">(optional)</span></label>
       <input type="text" id="recipient_address2" name="recipient_address2"
+             maxlength="500"
              value="{{ (recipient.address2 if recipient else '') or '' }}">
     </div>
 
@@ -51,6 +56,7 @@
       <div class="field">
         <label for="recipient_city">City</label>
         <input type="text" id="recipient_city" name="recipient_city" required
+               maxlength="500"
                value="{{ (recipient.city if recipient else '') or '' }}">
       </div>
 

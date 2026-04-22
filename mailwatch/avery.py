@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from mailwatch._catalog import check
+
 
 @dataclass(frozen=True)
 class AveryTemplate:
@@ -42,6 +44,10 @@ class AveryTemplate:
     @property
     def slots_per_sheet(self) -> int:
         return self.cols * self.rows
+
+    @property
+    def display(self) -> str:
+        return f"Avery {self.part} — {self.description}"
 
 
 AVERY: dict[str, AveryTemplate] = {
@@ -205,31 +211,24 @@ AVERY: dict[str, AveryTemplate] = {
 DEFAULT_AVERY = "8163"
 
 
-DISPLAY_NAMES: dict[str, str] = {
-    part: f"Avery {part} — {t.description}" for part, t in AVERY.items()
-}
-
-
-def _check(cond: bool, msg: str) -> None:
-    if not cond:
-        raise AssertionError(msg)
+DISPLAY_NAMES: dict[str, str] = {part: tpl.display for part, tpl in AVERY.items()}
 
 
 def _validate() -> None:
     for part, tpl in AVERY.items():
-        _check(tpl.cols >= 1 and tpl.rows >= 1, f"{part}: cols/rows must be positive")
-        _check(tpl.label_w > 0 and tpl.label_h > 0, f"{part}: label dims must be positive")
+        check(tpl.cols >= 1 and tpl.rows >= 1, f"{part}: cols/rows must be positive")
+        check(tpl.label_w > 0 and tpl.label_h > 0, f"{part}: label dims must be positive")
         last_right = tpl.x0 + (tpl.cols - 1) * tpl.dx + tpl.label_w
         last_bottom = tpl.y0 + (tpl.rows - 1) * tpl.dy + tpl.label_h
-        _check(
+        check(
             last_right <= tpl.page_w + 1e-6,
             f"{part}: last column spills past page width ({last_right} > {tpl.page_w})",
         )
-        _check(
+        check(
             last_bottom <= tpl.page_h + 1e-6,
             f"{part}: last row spills past page height ({last_bottom} > {tpl.page_h})",
         )
-    _check(DEFAULT_AVERY in AVERY, "DEFAULT_AVERY missing from catalog")
+    check(DEFAULT_AVERY in AVERY, "DEFAULT_AVERY missing from catalog")
 
 
 _validate()

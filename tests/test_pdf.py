@@ -1,17 +1,17 @@
 """Smoke tests for :mod:`mailwatch.pdf` (WeasyPrint backend).
 
-The prior reportlab-era suite asserted byte-level PDF content by
-disabling stream compression. WeasyPrint's output isn't byte-stable in
-the same way (it compresses + uses different object layout), so the
-invariants here are cheap and platform-independent:
+WeasyPrint output isn't byte-stable (compressed object streams, randomised
+IDs), so the invariants here are cheap and platform-independent:
 
 * Render doesn't raise.
 * Output is a syntactically valid PDF (magic + EOF).
 * Page dimensions match the spec.
-* For Avery renders, page count matches the distribution we asked for.
+* Text block origins land where the spec says they should.
 
-Deeper text-level assertions can be added with `pypdf` / `pdfplumber`
-later if needed — intentionally absent here to keep the suite fast.
+Per-size WeasyPrint rendering is limited to 3 representative envelopes
+(smallest, default, largest); the remaining sizes are verified via pure
+geometry math in ``test_layouts.py`` — rendering them adds wall time
+without new failure modes.
 """
 
 from __future__ import annotations
@@ -24,6 +24,9 @@ import pytest
 from mailwatch.avery import AVERY
 from mailwatch.layouts import ENVELOPES
 from mailwatch.pdf import LabelData, render_avery, render_envelope
+
+_PT_PER_INCH = 72.0
+
 
 # --------------------------------------------------------------------------- #
 # Fixtures                                                                    #
@@ -67,13 +70,33 @@ def _page_count(blob: bytes) -> int:
 
 
 def _page_dims_inches(blob: bytes, page: int = 0) -> tuple[float, float]:
-    """Return (width, height) of ``page`` in inches.
-
-    PDF MediaBox is in points (72 pt/in).
-    """
+    """Return (width, height) of ``page`` in inches (MediaBox is in points)."""
     reader = pypdf.PdfReader(io.BytesIO(blob))
     mb = reader.pages[page].mediabox
-    return round(float(mb.width) / 72, 3), round(float(mb.height) / 72, 3)
+    return round(float(mb.width) / _PT_PER_INCH, 3), round(float(mb.height) / _PT_PER_INCH, 3)
+
+
+def _text_emit_positions(blob: bytes) -> list[tuple[float, float, str]]:
+    """Return (x_pt, y_pt, sample_text) for every text-run emit on page 0.
+
+    Uses pypdf's visitor hook, which fires once per ``Tj`` / ``TJ``
+    operator. Each emit carries the *start* position of the run — enough
+    to prove content began inside its declared block, not enough to prove
+    it ended inside it (for that see the _validate() rectangle
+    invariants in :mod:`mailwatch.layouts`).
+    """
+    out: list[tuple[float, float, str]] = []
+
+    def visit(text: str, cm, tm, font_dict, font_size) -> None:
+        if not text or text.isspace():
+            return
+        x = float(tm[4]) + float(cm[4])
+        y = float(tm[5]) + float(cm[5])
+        out.append((x, y, text[:20]))
+
+    reader = pypdf.PdfReader(io.BytesIO(blob))
+    reader.pages[0].extract_text(visitor_text=visit)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -128,13 +151,14 @@ def test_envelope_rejects_bad_tracking_length(
         )
 
 
-@pytest.mark.parametrize("size", list(ENVELOPES))
+# Smallest / default / largest envelope — the math-level dim checks live in
+# test_layouts; no need to render all 9 through WeasyPrint.
+@pytest.mark.parametrize("size", ["#6_3_4", "#10", "A10"])
 def test_envelope_page_dims_match_spec(
     size: str,
     sender_lines: list[str],
     recipient_lines: list[str],
 ) -> None:
-    """Every catalog size renders at the declared page dimensions."""
     buf = io.BytesIO()
     render_envelope(
         sender_lines,
@@ -151,11 +175,57 @@ def test_envelope_page_dims_match_spec(
     assert _page_dims_inches(blob) == (round(spec.w, 3), round(spec.h, 3))
 
 
-def test_envelope_long_content_does_not_widen_block(
+def test_envelope_text_emits_start_inside_declared_blocks(
+    sender_lines: list[str],
     recipient_lines: list[str],
 ) -> None:
-    """A comically long sender line should clip rather than spilling into the barcode area."""
-    very_long = ["X" * 200]
+    """Every text run on the envelope begins inside the sender or recipient block.
+
+    The _validate() invariants prove the declared blocks don't collide with
+    the barcode; this test proves the rendered content actually starts
+    inside them. Together they close the 'long content spilled into the
+    barcode' regression class.
+    """
+    buf = io.BytesIO()
+    render_envelope(
+        sender_lines,
+        recipient_lines,
+        tracking="00040904164589000001",
+        routing="100012345",
+        out=buf,
+    )
+    spec = ENVELOPES["#10"]
+    sender_x_pt = spec.sender.x * _PT_PER_INCH
+    sender_right_pt = (spec.sender.x + spec.sender.w) * _PT_PER_INCH
+    recipient_x_pt = spec.recipient.x * _PT_PER_INCH
+    recipient_right_pt = (spec.recipient.x + spec.recipient.w) * _PT_PER_INCH
+    barcode_x_pt = spec.barcode.x * _PT_PER_INCH
+    barcode_right_pt = (spec.barcode.x + spec.barcode.w) * _PT_PER_INCH
+    for x_pt, _y_pt, sample in _text_emit_positions(buf.getvalue()):
+        # Barcode glyphs (F/A/D/T) render via the USPSIMBStandard font.
+        is_barcode = set(sample).issubset({"F", "A", "D", "T"})
+        if is_barcode:
+            assert barcode_x_pt - 1 <= x_pt <= barcode_right_pt + 1, (
+                f"barcode glyph {sample!r} at x={x_pt}pt outside bar column "
+                f"({barcode_x_pt}..{barcode_right_pt})"
+            )
+            continue
+        # Non-barcode text must begin inside either the sender or recipient
+        # block. Both are 4" wide so the bounds are generous.
+        in_sender = sender_x_pt <= x_pt <= sender_right_pt
+        in_recipient = recipient_x_pt <= x_pt <= recipient_right_pt
+        assert in_sender or in_recipient, (
+            f"text {sample!r} started at x={x_pt}pt, outside sender "
+            f"({sender_x_pt}..{sender_right_pt}) and recipient "
+            f"({recipient_x_pt}..{recipient_right_pt})"
+        )
+
+
+def test_envelope_long_sender_still_renders_single_page(
+    recipient_lines: list[str],
+) -> None:
+    """A 500-char sender line clips via CSS max-width+overflow; PDF stays one page."""
+    very_long = ["X" * 500]
     buf = io.BytesIO()
     render_envelope(
         very_long,
@@ -164,7 +234,9 @@ def test_envelope_long_content_does_not_widen_block(
         routing="100012345",
         out=buf,
     )
-    _assert_valid_pdf(buf.getvalue())
+    blob = buf.getvalue()
+    _assert_valid_pdf(blob)
+    assert _page_count(blob) == 1
 
 
 def test_envelope_unknown_size_raises() -> None:
@@ -207,39 +279,21 @@ def test_avery_fill_with_skip(label: LabelData) -> None:
     _assert_valid_pdf(buf.getvalue())
 
 
-def test_avery_batch_multiple_labels(label: LabelData) -> None:
-    labels = [{**label, "recipient": [f"RECIPIENT {i}"]} for i in range(3)]
+def test_avery_fill_at_last_slot_produces_one_label(label: LabelData) -> None:
+    """Start at the final slot (row 5, col 2 on 8163) → exactly one label, one page."""
     buf = io.BytesIO()
-    render_avery(labels, buf, mode="batch")
-    _assert_valid_pdf(buf.getvalue())
-
-
-def test_avery_single_rejects_list_input(label: LabelData) -> None:
-    with pytest.raises(ValueError, match="single LabelData"):
-        render_avery([label, label], io.BytesIO(), mode="single")
-
-
-def test_avery_batch_requires_list(label: LabelData) -> None:
-    with pytest.raises(ValueError, match="list of LabelData"):
-        render_avery(label, io.BytesIO(), mode="batch")
+    render_avery(label, buf, mode="fill", start_row=5, start_col=2)
+    blob = buf.getvalue()
+    _assert_valid_pdf(blob)
+    assert _page_count(blob) == 1
 
 
 def test_avery_rejects_out_of_range_start_position(label: LabelData) -> None:
-    # 8163 is 2 cols x 5 rows — anything beyond that must fail.
+    # 8163 is 2 cols x 5 rows — anything beyond that must fail at the library boundary.
     with pytest.raises(ValueError, match="start_row must be"):
         render_avery(label, io.BytesIO(), start_row=0)
     with pytest.raises(ValueError, match="start_col must be"):
         render_avery(label, io.BytesIO(), start_col=3)
-
-
-def test_avery_batch_spills_across_pages(label: LabelData) -> None:
-    """15 distinct labels on 8163 → 2 pages (10 on first, 5 on second)."""
-    labels = [{**label, "recipient": [f"RECIPIENT {i}"]} for i in range(15)]
-    buf = io.BytesIO()
-    render_avery(labels, buf, mode="batch")
-    blob = buf.getvalue()
-    _assert_valid_pdf(blob)
-    assert _page_count(blob) == 2
 
 
 # Cover one part from each geometry family (shipping / address / return-address)
@@ -250,7 +304,6 @@ def test_avery_parts_smoke(label: LabelData, part: str) -> None:
     render_avery(label, buf, part=part, mode="fill")
     blob = buf.getvalue()
     _assert_valid_pdf(blob)
-    # 8.5 x 11 US Letter for every part in the catalog.
     tpl = AVERY[part]
     assert _page_dims_inches(blob) == (round(tpl.page_w, 3), round(tpl.page_h, 3))
 

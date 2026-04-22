@@ -236,6 +236,29 @@ def test_download_pdf_envelope_different_size(client: TestClient) -> None:
     assert resp.content.startswith(b"%PDF-")
 
 
+def test_preview_clamps_stale_row_col_into_chosen_grid(client: TestClient) -> None:
+    """A URL built against 5167 (4x20) must not 500 when switched to 8163 (2x5)."""
+    _submit_generate(client, format_type="avery")
+    resp = client.get(
+        "/preview",
+        params={"fmt": "avery", "part": "8163", "row": 999, "col": 999},
+    )
+    assert resp.status_code == 200, resp.text
+    # Rebuilt PDF URL should carry the clamped values (2, 5).
+    assert "row=5" in resp.text
+    assert "col=2" in resp.text
+
+
+def test_download_pdf_clamps_stale_row_col(client: TestClient) -> None:
+    _submit_generate(client, format_type="avery")
+    resp = client.get(
+        "/download/pdf",
+        params={"fmt": "avery", "part": "8163", "row": 999, "col": 999},
+    )
+    assert resp.status_code == 200
+    assert resp.content.startswith(b"%PDF-")
+
+
 def test_download_pdf_avery(client: TestClient) -> None:
     _submit_generate(client, format_type="avery")
     resp = client.get(
@@ -272,40 +295,88 @@ def test_hr_flag_toggles(client: TestClient) -> None:
     assert on.content != off.content
 
 
+def test_hr_checkbox_off_round_trip_through_form(client: TestClient) -> None:
+    """Unchecking the HR checkbox must actually persist through /preview → /download/pdf.
+
+    Regression guard for the checkbox-off-silently-reverted bug: the form
+    emits a hidden ``hr=0`` before the checkbox and the checkbox itself
+    emits ``hr=1`` when checked. ``_parse_bool_last`` takes the last
+    value, so unchecked (``?hr=0``) stays off and checked (``?hr=0&hr=1``)
+    is on.
+    """
+    _submit_generate(client)
+
+    # Simulate browser submit of the form with checkbox UNCHECKED — only hr=0 sent.
+    resp_off = client.get("/preview?fmt=envelope&size=%2310&hr=0")
+    assert resp_off.status_code == 200
+    # Rebuilt PDF URL should reflect hr=0, and the checkbox should NOT be checked.
+    assert "hr=0" in resp_off.text
+    assert 'name="hr" value="1" checked' not in resp_off.text
+
+    # Simulate checked: both hidden hr=0 AND checkbox hr=1, in form order.
+    resp_on = client.get("/preview?fmt=envelope&size=%2310&hr=0&hr=1")
+    assert resp_on.status_code == 200
+    assert "hr=1" in resp_on.text
+    assert 'value="1" checked' in resp_on.text
+
+
+def test_parse_bool_last_unit() -> None:
+    """_parse_bool_last: empty → True (first visit); else last value wins."""
+    from mailwatch.routes import _parse_bool_last
+
+    assert _parse_bool_last([]) is True
+    assert _parse_bool_last(["0"]) is False
+    assert _parse_bool_last(["1"]) is True
+    assert _parse_bool_last(["0", "1"]) is True  # checked: hidden + checkbox
+    assert _parse_bool_last(["1", "0"]) is False
+    assert _parse_bool_last(["true"]) is False  # narrow surface — only "1" is truthy
+    assert _parse_bool_last(["yes"]) is False
+
+
 # --------------------------------------------------------------------------- #
 # Regen stability — changing output options must NOT allocate a new serial    #
 # --------------------------------------------------------------------------- #
 
 
-def test_preview_regen_keeps_same_serial(client: TestClient) -> None:
+def test_preview_regen_keeps_same_serial(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Changing size / part / mode / hr must not mint a new IMb serial.
 
-    Protection against a future refactor that accidentally turns option
-    changes into round-trips through ``/generate``.
+    Couples the test to the actual invariant ("``db.next_serial`` called
+    exactly once") instead of a regex on the rendered tracking URL — so
+    a later change to the tracking-link HTML format doesn't silently
+    pass this check.
     """
+    from mailwatch import db, routes
+
+    call_count = {"n": 0}
+    real_next_serial = db.next_serial
+
+    def counting_next_serial(conn: Any, bucket: int) -> int:
+        call_count["n"] += 1
+        return real_next_serial(conn, bucket)
+
+    monkeypatch.setattr(routes.db, "next_serial", counting_next_serial)
+
     _submit_generate(client)
-    # Grab the serial from the first preview page.
-    resp1 = client.get("/preview", params={"fmt": "envelope"})
-    # Each size change should hit /preview with a different query but the
-    # same session-held serial. Parse the tracking link out of the HTML
-    # instead of poking at internal cookie state.
-    import re
+    assert call_count["n"] == 1, "initial /generate should allocate exactly one serial"
 
-    m1 = re.search(r"/tracking\?serial=(\d+)", resp1.text)
-    assert m1, resp1.text
-    serial1 = m1.group(1)
+    # N regen clicks across envelope sizes + Avery parts — none should re-call next_serial.
+    for params in [
+        {"fmt": "envelope", "size": "A7"},
+        {"fmt": "envelope", "size": "#11"},
+        {"fmt": "envelope", "size": "#6_3_4"},
+        {"fmt": "avery", "part": "5163"},
+        {"fmt": "avery", "part": "8163", "mode": "single"},
+        {"fmt": "envelope", "hr": "0"},
+    ]:
+        resp = client.get("/preview", params=params)
+        assert resp.status_code == 200, (params, resp.text)
 
-    for size in ("A7", "#11", "#6_3/4"):
-        resp = client.get("/preview", params={"fmt": "envelope", "size": size})
-        assert resp.status_code == 200, (size, resp.text)
-        m = re.search(r"/tracking\?serial=(\d+)", resp.text)
-        assert m and m.group(1) == serial1, (size, resp.text)
-
-    # Same expectation when switching to Avery.
-    resp2 = client.get("/preview", params={"fmt": "avery", "part": "5163"})
-    assert resp2.status_code == 200
-    m2 = re.search(r"/tracking\?serial=(\d+)", resp2.text)
-    assert m2 and m2.group(1) == serial1
+    assert (
+        call_count["n"] == 1
+    ), f"/preview must not reallocate serials; got {call_count['n']} total calls"
 
 
 # --------------------------------------------------------------------------- #

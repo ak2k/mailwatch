@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from mailwatch._catalog import check
+
 
 @dataclass(frozen=True)
 class Block:
@@ -35,35 +37,39 @@ class Block:
     h: float
 
     @property
-    def right(self) -> float:
+    def _right(self) -> float:
         return self.x + self.w
 
     @property
-    def top(self) -> float:
+    def _top(self) -> float:
         return self.y + self.h
 
     def overlaps(self, other: Block) -> bool:
         return (
-            self.x < other.right
-            and other.x < self.right
-            and self.y < other.top
-            and other.y < self.top
+            self.x < other._right
+            and other.x < self._right
+            and self.y < other._top
+            and other.y < self._top
         )
 
     def inside(self, outer: Block) -> bool:
         return (
             self.x >= outer.x
             and self.y >= outer.y
-            and self.right <= outer.right
-            and self.top <= outer.top
+            and self._right <= outer._right
+            and self._top <= outer._top
         )
 
 
 @dataclass(frozen=True)
 class EnvelopeSpec:
-    """Page size + block positions for one envelope size."""
+    """Page size + block positions for one envelope size.
 
-    name: str
+    ``display`` is the human-readable label for UI dropdowns (e.g.
+    ``#10 — 9.5" x 4.125"``). Catalog keys are ASCII-safe ids.
+    """
+
+    display: str
     w: float
     h: float
     sender: Block
@@ -85,20 +91,24 @@ class EnvelopeSpec:
         return Block(self.w - 4.75, 0.0, 4.75, 0.625)
 
 
-def _landscape(name: str, w: float, h: float) -> EnvelopeSpec:
+def _landscape(display: str, w: float, h: float) -> EnvelopeSpec:
     """Standard layout for landscape letter envelopes.
 
     Sender sits top-left in a 4"x1" box. Recipient sits right-of-center in a
     4"x1.25" box above the BCZ, fully inside the OCR Read Area. Barcode
     is 4.5"x0.5" centered inside the 4.75"x0.625" BCZ, with 0.0625"
     clearance on each side so the rendered bars have headroom over the
-    actual USPSIMBStandard glyph width (see §7 of the plan).
+    actual USPSIMBStandard glyph width.
 
     These numbers are chosen so the same three blocks fit every envelope
     from #6¾ (the smallest) up through A10 without per-size overrides.
+    Invitation envelopes (A2, A6) are NOT included: their narrow aspect
+    ratios and common addressing conventions don't match this
+    recipient-right / barcode-bottom-right layout. Add them only after
+    verifying a real printed piece against USPS OCR/BCZ requirements.
     """
     return EnvelopeSpec(
-        name=name,
+        display=display,
         w=w,
         h=h,
         sender=Block(x=0.25, y=h - 1.25, w=4.0, h=1.0),
@@ -108,52 +118,31 @@ def _landscape(name: str, w: float, h: float) -> EnvelopeSpec:
 
 
 ENVELOPES: dict[str, EnvelopeSpec] = {
-    "#6_3/4": _landscape("#6_3/4", 6.5, 3.625),
-    "#7_3/4": _landscape("#7_3/4", 7.5, 3.875),
-    "#9": _landscape("#9", 8.875, 3.875),
-    "#10": _landscape("#10", 9.5, 4.125),
-    "#11": _landscape("#11", 10.375, 4.5),
-    "#12": _landscape("#12", 11.0, 4.75),
-    "A2": _landscape("A2", 5.75, 4.375),
-    "A6": _landscape("A6", 6.5, 4.75),
-    "A7": _landscape("A7", 7.25, 5.25),
-    "A8": _landscape("A8", 8.125, 5.5),
-    "A10": _landscape("A10", 9.5, 6.0),
+    "#6_3_4": _landscape('#6¾ — 6.5" x 3.625"', 6.5, 3.625),
+    "#7_3_4": _landscape('#7¾ (Monarch) — 7.5" x 3.875"', 7.5, 3.875),
+    "#9": _landscape('#9 — 8.875" x 3.875"', 8.875, 3.875),
+    "#10": _landscape('#10 — 9.5" x 4.125" (default)', 9.5, 4.125),
+    "#11": _landscape('#11 — 10.375" x 4.5"', 10.375, 4.5),
+    "#12": _landscape('#12 — 11" x 4.75"', 11.0, 4.75),
+    "A7": _landscape('A7 — 7.25" x 5.25"', 7.25, 5.25),
+    "A8": _landscape('A8 — 8.125" x 5.5"', 8.125, 5.5),
+    "A10": _landscape('A10 — 9.5" x 6"', 9.5, 6.0),
 }
-"""Catalog keyed by a stable machine-safe id.
+"""Catalog keyed by a URL-safe ASCII id.
 
-Display labels (``"#6¾"``, ``"#7¾"``) live on the form template; the
-keys avoid non-ASCII in URLs and session values. ``A2`` / ``A6`` are
-listed here but have not been verified against USPS geometry on an
-actual printed piece — flagged as an open question in the plan.
+Keys avoid both fragment (``#``) and path-separator (``/``) tension by
+using the form ``#N`` or ``#N_D_D`` — ``#`` is the only non-alphanumeric
+character, and it's consistently percent-encoded via ``urlencode`` at
+every route boundary.
+
+Invitation envelopes (A2, A6) are intentionally absent — see
+:func:`_landscape` docstring.
 """
 
 DEFAULT_ENVELOPE = "#10"
 
 
-DISPLAY_NAMES: dict[str, str] = {
-    "#6_3/4": '#6¾ — 6.5" x 3.625"',
-    "#7_3/4": '#7¾ (Monarch) — 7.5" x 3.875"',
-    "#9": '#9 — 8.875" x 3.875"',
-    "#10": '#10 — 9.5" x 4.125" (default)',
-    "#11": '#11 — 10.375" x 4.5"',
-    "#12": '#12 — 11" x 4.75"',
-    "A2": 'A2 — 5.75" x 4.375"',
-    "A6": 'A6 — 6.5" x 4.75"',
-    "A7": 'A7 — 7.25" x 5.25"',
-    "A8": 'A8 — 8.125" x 5.5"',
-    "A10": 'A10 — 9.5" x 6"',
-}
-
-
-def _check(cond: bool, msg: str) -> None:
-    """Raise :class:`AssertionError` on invariant violation.
-
-    Plain ``assert`` would be stripped under ``python -O``; this stays in
-    so startup fails loudly no matter how the interpreter is invoked.
-    """
-    if not cond:
-        raise AssertionError(msg)
+DISPLAY_NAMES: dict[str, str] = {k: v.display for k, v in ENVELOPES.items()}
 
 
 def _validate() -> None:
@@ -162,28 +151,24 @@ def _validate() -> None:
         page = spec.page()
         ocr = spec.ocr_read_area()
         bcz = spec.bcz()
-        _check(spec.sender.inside(page), f"{name}: sender outside page")
-        _check(spec.recipient.inside(page), f"{name}: recipient outside page")
-        _check(spec.barcode.inside(page), f"{name}: barcode outside page")
-        _check(
+        check(spec.sender.inside(page), f"{name}: sender outside page")
+        check(spec.recipient.inside(page), f"{name}: recipient outside page")
+        check(spec.barcode.inside(page), f"{name}: barcode outside page")
+        check(
             not spec.sender.overlaps(spec.recipient),
             f"{name}: sender/recipient overlap",
         )
-        _check(
+        check(
             not spec.sender.overlaps(spec.barcode),
             f"{name}: sender/barcode overlap",
         )
-        _check(
+        check(
             not spec.recipient.overlaps(spec.barcode),
             f"{name}: recipient/barcode overlap",
         )
-        _check(spec.recipient.inside(ocr), f"{name}: recipient outside OCR Read Area")
-        _check(spec.barcode.inside(bcz), f"{name}: barcode outside BCZ")
-    _check(DEFAULT_ENVELOPE in ENVELOPES, "DEFAULT_ENVELOPE missing from catalog")
-    _check(
-        set(DISPLAY_NAMES) == set(ENVELOPES),
-        "DISPLAY_NAMES keys must match ENVELOPES",
-    )
+        check(spec.recipient.inside(ocr), f"{name}: recipient outside OCR Read Area")
+        check(spec.barcode.inside(bcz), f"{name}: barcode outside BCZ")
+    check(DEFAULT_ENVELOPE in ENVELOPES, "DEFAULT_ENVELOPE missing from catalog")
 
 
 _validate()

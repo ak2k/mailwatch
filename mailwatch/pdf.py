@@ -54,7 +54,7 @@ class LabelData(TypedDict):
     routing: str
 
 
-AveryMode = Literal["single", "fill", "batch"]
+AveryMode = Literal["single", "fill"]
 
 _TRACKING_LEN = 20  # USPS-B-3200 IMb tracking code length
 
@@ -178,41 +178,32 @@ def _label_dict(
     }
 
 
-def _assign_positions(
-    items: list[LabelData],
+def _positions_for_single_label(
+    label: LabelData,
     start_row: int,
     start_col: int,
+    count: int,
     *,
     cols: int,
-    rows: int,
     human_readable: bool,
-) -> list[list[dict[str, object]]]:
-    """Distribute ``items`` across sheet positions starting at (start_row, start_col).
+) -> list[dict[str, object]]:
+    """Place the same ``label`` into ``count`` sequential slots starting at (start_row, start_col).
 
-    Returns a list of pages; each page is a list of label-dicts with
-    their (row, col) fixed. Row-major within each page; overflow
-    spills to additional pages starting at (1, 1).
+    Row-major; caller guarantees ``count`` fits on one page.
     """
-    pages: list[list[dict[str, object]]] = []
-    current: list[dict[str, object]] = []
+    out: list[dict[str, object]] = []
     row, col = start_row, start_col
-    for item in items:
-        current.append(_label_dict(item, row, col, human_readable=human_readable))
+    for _ in range(count):
+        out.append(_label_dict(label, row, col, human_readable=human_readable))
         col += 1
         if col > cols:
             col = 1
             row += 1
-        if row > rows:
-            pages.append(current)
-            current = []
-            row, col = 1, 1
-    if current:
-        pages.append(current)
-    return pages
+    return out
 
 
 def render_avery(
-    labels_data: list[LabelData] | LabelData,
+    label: LabelData,
     out: BinaryIO,
     *,
     part: str = DEFAULT_AVERY,
@@ -224,23 +215,20 @@ def render_avery(
     """Render an Avery label sheet to ``out``.
 
     Args:
-        labels_data: A single :class:`LabelData` (``mode="single"`` or
-            ``"fill"``) or a list (``mode="batch"``).
+        label: The single :class:`LabelData` to place. mailwatch's product
+            flow is one-mail-piece-at-a-time — a multi-label "batch" mode
+            would require a UI that collects several recipients up front,
+            which the product doesn't have today. Keeping this narrow
+            avoids the dead-code liability the reviewers flagged.
         out: Binary sink for the rendered PDF bytes.
         part: Key into :data:`mailwatch.avery.AVERY` (default ``"8163"``).
-        mode: How to distribute ``labels_data`` across sheet positions.
+        mode: How to distribute ``label`` across sheet positions.
 
-            * ``"single"`` — exactly one label at
-              (``start_row``, ``start_col``). Matches upstream's
-              one-label-per-PDF behaviour for partial-sheet reuse.
-            * ``"fill"`` (default) — repeat the single label across
-              every remaining slot starting at
-              (``start_row``, ``start_col``).
-            * ``"batch"`` — ``labels_data`` is a list of distinct
-              labels, placed row-major starting at
-              (``start_row``, ``start_col``), spilling to additional
-              pages if there are more than ``slots_per_sheet - skip``
-              entries.
+            * ``"single"`` — exactly one label at (``start_row``, ``start_col``).
+              For partial-sheet reuse where the rest of the sheet was already
+              consumed on a previous print.
+            * ``"fill"`` (default) — repeat the label across every remaining
+              slot starting at (``start_row``, ``start_col``).
         start_row: 1-indexed row on page 1 (1..tpl.rows).
         start_col: 1-indexed column within that row (1..tpl.cols).
         human_readable: If True (default), draw the 20-digit tracking
@@ -253,32 +241,21 @@ def render_avery(
     if not 1 <= start_col <= tpl.cols:
         raise ValueError(f"start_col must be 1..{tpl.cols}, got {start_col}")
 
-    if mode == "batch":
-        if not isinstance(labels_data, list):
-            raise ValueError("mode='batch' requires a list of LabelData")
-        items: list[LabelData] = labels_data
-    else:
-        if isinstance(labels_data, list):
-            if len(labels_data) != 1:
-                raise ValueError(
-                    f"mode={mode!r} requires a single LabelData (got {len(labels_data)})"
-                )
-            single: LabelData = labels_data[0]
-        else:
-            single = labels_data
-        if mode == "single":
-            items = [single]
-        else:  # "fill"
-            skip = (start_row - 1) * tpl.cols + (start_col - 1)
-            items = [single] * max(0, tpl.slots_per_sheet - skip)
+    if mode == "single":
+        count = 1
+    else:  # "fill"
+        skip = (start_row - 1) * tpl.cols + (start_col - 1)
+        count = max(0, tpl.slots_per_sheet - skip)
 
-    pages = _assign_positions(
-        items,
+    labels = _positions_for_single_label(
+        label,
         start_row,
         start_col,
+        count,
         cols=tpl.cols,
-        rows=tpl.rows,
         human_readable=human_readable,
     )
+    # One page always — slot grid is bounded by start_{row,col}..tpl.slots_per_sheet.
+    pages = [labels] if labels else []
     html_str = _jinja.get_template("avery.html").render(tpl=tpl, pages=pages)
     HTML(string=html_str, base_url=str(_templates_dir())).write_pdf(out)

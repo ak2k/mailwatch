@@ -73,6 +73,12 @@
 
       <div class="field">
         <label class="checkbox">
+          {# Hidden `hr=0` before the checkbox → unchecked submits `?hr=0`,   #}
+          {# checked submits `?hr=0&hr=1`. `_parse_bool_last` takes the last  #}
+          {# value so the checkbox override wins when present. Without the    #}
+          {# hidden, an unchecked checkbox omits `hr` entirely and the server #}
+          {# treats missing as "default on" — silently reverting the user.    #}
+          <input type="hidden" name="hr" value="0">
           <input type="checkbox" name="hr" value="1" {% if hr %}checked{% endif %}>
           Print the tracking number in digits next to the barcode
         </label>

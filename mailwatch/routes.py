@@ -18,6 +18,7 @@ import io
 import json
 import logging
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 from time import time as _now
 from typing import Annotated, Any, Literal
@@ -42,6 +43,11 @@ from mailwatch.config import Settings
 from mailwatch.layouts import DEFAULT_ENVELOPE, DISPLAY_NAMES as _ENVELOPE_LABELS, ENVELOPES
 from mailwatch.models import AddressRequest, PushFeedPayload
 from mailwatch.usps_api import IVMTRClient, NewApiClient
+
+# Practical ceiling on any single session field so the cookie stays under
+# the ~4KB browser limit even after JSON + itsdangerous signature overhead.
+_MAX_FIELD_LEN = 500
+_MAX_SENDER_LEN = 1000
 
 logger = logging.getLogger(__name__)
 
@@ -115,18 +121,24 @@ class GenerateForm(BaseModel):
     format (``12345`` or ``12345-6789``) is enforced here so the handler
     can assume clean input.
 
+    ``max_length`` on every field keeps the serialised session cookie under
+    the browser's ~4KB ceiling — without it, a paste into the sender
+    textarea could grow the signed cookie past the limit, the browser
+    would silently drop ``Set-Cookie``, and every subsequent ``/preview``
+    would hit the empty-session 400 branch with no log signal.
+
     Output options (envelope size, Avery part, row/col, human-readable,
     etc.) are NOT on this form — they live on the preview page as query
     parameters, so changing them regenerates the PDF without touching
     the session or the allocated IMb serial.
     """
 
-    sender_address: str = Field(..., min_length=1)
-    recipient_name: str = Field(..., min_length=1)
-    recipient_company: str | None = None
-    recipient_street: str = Field(..., min_length=1)
-    recipient_address2: str | None = None
-    recipient_city: str = Field(..., min_length=1)
+    sender_address: str = Field(..., min_length=1, max_length=_MAX_SENDER_LEN)
+    recipient_name: str = Field(..., min_length=1, max_length=_MAX_FIELD_LEN)
+    recipient_company: str | None = Field(default=None, max_length=_MAX_FIELD_LEN)
+    recipient_street: str = Field(..., min_length=1, max_length=_MAX_FIELD_LEN)
+    recipient_address2: str | None = Field(default=None, max_length=_MAX_FIELD_LEN)
+    recipient_city: str = Field(..., min_length=1, max_length=_MAX_FIELD_LEN)
     recipient_state: str = Field(..., min_length=2, max_length=2, pattern=r"^[A-Za-z]{2}$")
     recipient_zip: str = Field(..., pattern=_ZIP_PATTERN)
     format_type: Literal["envelope", "avery"] = "envelope"
@@ -178,21 +190,40 @@ def _build_tracking(settings: Settings, serial: int) -> str:
     )
 
 
-def _recipient_lines_from_session(recipient: dict[str, Any]) -> list[str]:
-    """Render a recipient dict (as stored in the session) as display lines."""
-    lines: list[str] = [recipient["name"]]
-    if recipient.get("company"):
-        lines.append(recipient["company"])
-    lines.append(recipient["street"])
-    if recipient.get("address2"):
-        lines.append(recipient["address2"])
-    lines.append(f"{recipient['city']}, {recipient['state']} {recipient['zip']}")
-    return lines
+@dataclass(frozen=True)
+class MailPiece:
+    """The piece-of-mail identity held in the session cookie.
 
+    Allocated by :func:`post_generate`, read by :func:`get_preview` and
+    :func:`get_download_pdf`. Stable across regen — the serial is minted
+    once and re-used for every output-option change.
+    """
 
-def _sender_lines(sender_address: str) -> list[str]:
-    """Split the sender textarea into non-empty lines."""
-    return [line.strip() for line in sender_address.splitlines() if line.strip()]
+    sender_address: str
+    recipient: dict[str, Any]
+    serial: int
+    tracking: str
+    routing: str
+
+    @property
+    def recipient_zip(self) -> str:
+        return str(self.recipient["zip"])
+
+    def sender_lines(self) -> list[str]:
+        """Split the sender textarea into non-empty display lines."""
+        return [line.strip() for line in self.sender_address.splitlines() if line.strip()]
+
+    def recipient_lines(self) -> list[str]:
+        """Render the recipient dict as display lines."""
+        r = self.recipient
+        lines: list[str] = [r["name"]]
+        if r.get("company"):
+            lines.append(r["company"])
+        lines.append(r["street"])
+        if r.get("address2"):
+            lines.append(r["address2"])
+        lines.append(f"{r['city']}, {r['state']} {r['zip']}")
+        return lines
 
 
 # --------------------------------------------------------------------------- #
@@ -305,14 +336,16 @@ async def post_generate(
 #    (Secure in production via create_app(session_https_only=True)).
 #  - Holds: {sender_address, recipient, serial, tracking, routing}.
 #  - Lifetime: browser-close = gone (no server-side store).
-#  - Single-user service: no inter-tab lock. Two tabs = two cookies =
-#    two independent serials, which is the intuitive behavior.
+#  - Cookies are shared across same-origin tabs. Two tabs in one browser
+#    SHARE the session cookie — the last /generate wins, and both tabs
+#    render the most recent piece of mail on their next request. If you
+#    need to work on two pieces concurrently, use two browser profiles.
 #  - Serial stability: allocated once at /generate, preserved across
 #    every /preview option change. Only "Edit recipient" → /generate
 #    allocates a fresh serial.
 
 
-def _require_session_piece(request: Request) -> dict[str, Any]:
+def _require_session_piece(request: Request) -> MailPiece:
     """Extract the session-held mail piece or raise 400."""
     recipient = request.session.get("recipient")
     serial = request.session.get("serial")
@@ -324,24 +357,65 @@ def _require_session_piece(request: Request) -> dict[str, Any]:
             status_code=400,
             detail="No envelope in session; generate one first.",
         )
-    return {
-        "sender_address": sender_address,
-        "recipient": recipient,
-        "serial": serial,
-        "tracking": tracking,
-        "routing": routing or "",
-    }
+    return MailPiece(
+        sender_address=sender_address,
+        recipient=recipient,
+        serial=int(serial),
+        tracking=str(tracking),
+        routing=str(routing or ""),
+    )
 
 
-def _parse_hr(value: str | None) -> bool:
-    """Query-string bool: truthy if '1'/'true'/'on'/'yes' (case-insensitive)."""
-    if value is None:
+@dataclass(frozen=True)
+class PreviewOptions:
+    """Validated, clamped output options shared by /preview and /download/pdf.
+
+    Membership of ``size`` / ``part`` is verified; ``row`` / ``col`` are
+    clamped into the currently-chosen Avery grid so a stale URL from a
+    bigger-grid part (e.g. 5167's 4x20) can't 500 the render on a smaller
+    part (8163's 2x5). ``hr`` is the last-value-wins result of parsing
+    the ``hr`` query param — see :func:`_parse_bool_last`.
+    """
+
+    fmt: Literal["envelope", "avery"]
+    size: str
+    part: str
+    mode: Literal["single", "fill"]
+    row: int
+    col: int
+    hr: bool
+
+    def query_string(self) -> str:
+        """Render the options back into a canonical query string for the PDF URL."""
+        return urlencode(
+            {
+                "fmt": self.fmt,
+                "size": self.size,
+                "part": self.part,
+                "mode": self.mode,
+                "row": self.row,
+                "col": self.col,
+                "hr": "1" if self.hr else "0",
+            }
+        )
+
+
+def _parse_bool_last(values: list[str]) -> bool:
+    """Read the last value in a list of ``hr=0``/``hr=1`` query params.
+
+    The options form emits a hidden ``hr=0`` *before* the checkbox and the
+    checkbox itself sends ``hr=1`` when checked, so the browser submits
+    ``?hr=0`` when unchecked and ``?hr=0&hr=1`` when checked. Starlette's
+    default single-value query binding picks the *first* value, which
+    inverts the checkbox — so this helper deliberately takes the *last*.
+    An empty list (no form submission yet, first visit) defaults to True.
+    """
+    if not values:
         return True
-    return value.strip().lower() in {"1", "true", "on", "yes"}
+    return values[-1] == "1"
 
 
-@router.get("/preview", response_class=HTMLResponse)
-async def get_preview(
+def _preview_options(
     request: Request,
     fmt: Literal["envelope", "avery"] = "envelope",
     size: str = DEFAULT_ENVELOPE,
@@ -349,7 +423,32 @@ async def get_preview(
     mode: Literal["single", "fill"] = "fill",
     row: int = 1,
     col: int = 1,
-    hr: str | None = None,
+) -> PreviewOptions:
+    """FastAPI dep: parse, validate, clamp the output-options query string."""
+    if size not in ENVELOPES:
+        raise HTTPException(status_code=400, detail=f"unknown envelope size: {size}")
+    if part not in AVERY:
+        raise HTTPException(status_code=400, detail=f"unknown Avery part: {part}")
+    tpl = AVERY[part]
+    clamped_row = max(1, min(row, tpl.rows))
+    clamped_col = max(1, min(col, tpl.cols))
+    hr_on = _parse_bool_last(request.query_params.getlist("hr"))
+    return PreviewOptions(
+        fmt=fmt,
+        size=size,
+        part=part,
+        mode=mode,
+        row=clamped_row,
+        col=clamped_col,
+        hr=hr_on,
+    )
+
+
+@router.get("/preview", response_class=HTMLResponse)
+async def get_preview(
+    request: Request,
+    piece: MailPiece = Depends(_require_session_piece),
+    opts: PreviewOptions = Depends(_preview_options),
 ) -> Response:
     """Render the preview page with the current output options.
 
@@ -358,48 +457,22 @@ async def get_preview(
     and the PDF embed reloads. No POST, no session mutation, no new
     serial.
     """
-    piece = _require_session_piece(request)
-    if size not in ENVELOPES:
-        raise HTTPException(status_code=400, detail=f"unknown envelope size: {size}")
-    if part not in AVERY:
-        raise HTTPException(status_code=400, detail=f"unknown Avery part: {part}")
-
-    tpl = AVERY[part]
-    # Clamp row/col to the chosen Avery part's grid so a stale URL from a
-    # bigger-grid part doesn't 500 on the downstream render.
-    row = max(1, min(row, tpl.rows))
-    col = max(1, min(col, tpl.cols))
-    hr_on = _parse_hr(hr)
-
-    # Envelope keys contain '#' / '/' which must be percent-encoded so the
-    # browser doesn't treat them as fragment / path separators.
-    qs = urlencode(
-        {
-            "fmt": fmt,
-            "size": size,
-            "part": part,
-            "mode": mode,
-            "row": row,
-            "col": col,
-            "hr": "1" if hr_on else "0",
-        }
-    )
-    pdf_url = f"/download/pdf?{qs}"
-    tracking_url = f"/tracking?serial={piece['serial']}&zip={piece['recipient']['zip']}"
-
+    tpl = AVERY[opts.part]
+    pdf_url = f"/download/pdf?{opts.query_string()}"
+    tracking_url = f"/tracking?serial={piece.serial}&zip={piece.recipient_zip}"
     return templates.TemplateResponse(
         request,
         "preview.html",
         {
-            "serial": piece["serial"],
-            "recipient_zip": piece["recipient"]["zip"],
-            "fmt": fmt,
-            "size": size,
-            "part": part,
-            "mode": mode,
-            "row": row,
-            "col": col,
-            "hr": hr_on,
+            "serial": piece.serial,
+            "recipient_zip": piece.recipient_zip,
+            "fmt": opts.fmt,
+            "size": opts.size,
+            "part": opts.part,
+            "mode": opts.mode,
+            "row": opts.row,
+            "col": opts.col,
+            "hr": opts.hr,
             "envelope_choices": list(_ENVELOPE_LABELS.items()),
             "avery_choices": list(_AVERY_LABELS.items()),
             "avery_max_row": tpl.rows,
@@ -412,59 +485,40 @@ async def get_preview(
 
 @router.get("/download/pdf")
 async def get_download_pdf(
-    request: Request,
-    fmt: Literal["envelope", "avery"] = "envelope",
-    size: str = DEFAULT_ENVELOPE,
-    part: str = DEFAULT_AVERY,
-    mode: Literal["single", "fill"] = "fill",
-    row: int = 1,
-    col: int = 1,
-    hr: str | None = None,
+    piece: MailPiece = Depends(_require_session_piece),
+    opts: PreviewOptions = Depends(_preview_options),
 ) -> Response:
     """Render the session's mail piece as a PDF using the given options."""
-    piece = _require_session_piece(request)
-    if size not in ENVELOPES:
-        raise HTTPException(status_code=400, detail=f"unknown envelope size: {size}")
-    if part not in AVERY:
-        raise HTTPException(status_code=400, detail=f"unknown Avery part: {part}")
-
-    sender_lines_val = _sender_lines(piece["sender_address"])
-    recipient_lines_val = _recipient_lines_from_session(piece["recipient"])
-    hr_on = _parse_hr(hr)
-
     buf = io.BytesIO()
-    if fmt == "envelope":
+    if opts.fmt == "envelope":
         await asyncio.to_thread(
             pdf.render_envelope,
-            sender_lines_val,
-            recipient_lines_val,
-            piece["tracking"],
-            piece["routing"],
+            piece.sender_lines(),
+            piece.recipient_lines(),
+            piece.tracking,
+            piece.routing,
             buf,
-            envelope_size=size,
-            human_readable=hr_on,
+            envelope_size=opts.size,
+            human_readable=opts.hr,
         )
-        filename = f"envelope-{piece['serial']}.pdf"
+        filename = f"envelope-{piece.serial}.pdf"
     else:
-        tpl = AVERY[part]
-        row = max(1, min(row, tpl.rows))
-        col = max(1, min(col, tpl.cols))
         label: pdf.LabelData = {
-            "recipient": recipient_lines_val,
-            "tracking": piece["tracking"],
-            "routing": piece["routing"],
+            "recipient": piece.recipient_lines(),
+            "tracking": piece.tracking,
+            "routing": piece.routing,
         }
         await asyncio.to_thread(
             pdf.render_avery,
             label,
             buf,
-            part=part,
-            mode=mode,
-            start_row=row,
-            start_col=col,
-            human_readable=hr_on,
+            part=opts.part,
+            mode=opts.mode,
+            start_row=opts.row,
+            start_col=opts.col,
+            human_readable=opts.hr,
         )
-        filename = f"avery-{part}-{piece['serial']}.pdf"
+        filename = f"avery-{opts.part}-{piece.serial}.pdf"
 
     return Response(
         content=buf.getvalue(),
