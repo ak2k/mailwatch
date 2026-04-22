@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from importlib import resources
 from pathlib import Path
-from typing import BinaryIO, Literal, TypedDict
+from typing import BinaryIO, TypedDict
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from weasyprint import HTML
@@ -54,7 +54,22 @@ class LabelData(TypedDict):
     routing: str
 
 
-AveryMode = Literal["single", "fill"]
+class EnvelopeData(TypedDict):
+    """Per-envelope payload for :func:`render_envelope`.
+
+    Mirrors :class:`LabelData` plus a per-envelope ``sender`` block,
+    since envelopes need a return-address region but Avery labels don't.
+    Passing a list of items (rather than a single recipient + list of
+    trackings) keeps ``render_envelope`` and ``render_avery`` symmetric
+    and leaves room for future batch mailings where each envelope
+    targets a distinct recipient.
+    """
+
+    sender: list[str]
+    recipient: list[str]
+    tracking: str
+    routing: str
+
 
 _TRACKING_LEN = 20  # USPS-B-3200 IMb tracking code length
 
@@ -125,32 +140,43 @@ def _human_readable(tracking: str, routing: str) -> str:
 
 
 def render_envelope(
-    sender: list[str],
-    recipient: list[str],
-    tracking: str,
-    routing: str,
+    envelopes: list[EnvelopeData],
     out: BinaryIO,
     *,
     envelope_size: str = DEFAULT_ENVELOPE,
     human_readable: bool = True,
 ) -> None:
-    """Render a single-envelope PDF to ``out``.
+    """Render ``len(envelopes)`` envelopes (one per page) to ``out``.
+
+    Each :class:`EnvelopeData` carries its own sender / recipient /
+    tracking / routing — the common batch flow passes N items with the
+    same sender/recipient/routing but distinct trackings, while future
+    multi-recipient batches would vary sender/recipient per item.
 
     Args:
+        envelopes: One entry per envelope page. Must be non-empty.
         envelope_size: Key into :data:`mailwatch.layouts.ENVELOPES`.
             Defaults to ``#10``. Unknown keys raise :class:`KeyError`.
-        human_readable: If True (default), draw the 20-digit tracking
-            + routing ZIP as small text directly above the barcode bars.
-            USPS doesn't require it — pass False to omit.
+            The same size applies to every envelope in ``envelopes``.
+        human_readable: Draw the tiny numeric reference row above the
+            barcode on every envelope. Pass False to omit.
     """
+    if not envelopes:
+        raise ValueError("envelopes must be non-empty")
     spec = ENVELOPES[envelope_size]
+    env_dicts = [
+        {
+            "sender_lines": env["sender"],
+            "recipient_lines": env["recipient"],
+            "barcode_bars": _encode_bars(env["tracking"], env["routing"]),
+            "human_readable_text": _human_readable(env["tracking"], env["routing"]),
+        }
+        for env in envelopes
+    ]
     html_str = _jinja.get_template("envelope.html").render(
         spec=spec,
-        sender_lines=sender,
-        recipient_lines=recipient,
-        barcode_bars=_encode_bars(tracking, routing),
+        envelopes=env_dicts,
         human_readable=human_readable,
-        human_readable_text=_human_readable(tracking, routing),
     )
     HTML(string=html_str, base_url=str(_templates_dir())).write_pdf(out)
 
@@ -178,84 +204,58 @@ def _label_dict(
     }
 
 
-def _positions_for_single_label(
-    label: LabelData,
-    start_row: int,
-    start_col: int,
-    count: int,
-    *,
-    cols: int,
-    human_readable: bool,
-) -> list[dict[str, object]]:
-    """Place the same ``label`` into ``count`` sequential slots starting at (start_row, start_col).
-
-    Row-major; caller guarantees ``count`` fits on one page.
-    """
-    out: list[dict[str, object]] = []
-    row, col = start_row, start_col
-    for _ in range(count):
-        out.append(_label_dict(label, row, col, human_readable=human_readable))
-        col += 1
-        if col > cols:
-            col = 1
-            row += 1
-    return out
-
-
 def render_avery(
-    label: LabelData,
+    labels: list[LabelData],
     out: BinaryIO,
     *,
     part: str = DEFAULT_AVERY,
-    mode: AveryMode = "fill",
     start_row: int = 1,
     start_col: int = 1,
     human_readable: bool = True,
 ) -> None:
-    """Render an Avery label sheet to ``out``.
+    """Render ``len(labels)`` labels across one or more Avery sheets.
+
+    Labels are placed row-major starting at (``start_row``, ``start_col``)
+    on page 1. When page 1 runs out of slots, overflow continues on
+    page 2 starting at (1, 1). Each :class:`LabelData` carries its own
+    tracking + routing + recipient — callers pass a list of distinct
+    labels for batch mailings (one IMb serial per physical letter), or a
+    single-item list for the common one-letter flow.
 
     Args:
-        label: The single :class:`LabelData` to place. mailwatch's product
-            flow is one-mail-piece-at-a-time — a multi-label "batch" mode
-            would require a UI that collects several recipients up front,
-            which the product doesn't have today. Keeping this narrow
-            avoids the dead-code liability the reviewers flagged.
-        out: Binary sink for the rendered PDF bytes.
+        labels: One entry per physical label. Must be non-empty.
         part: Key into :data:`mailwatch.avery.AVERY` (default ``"8163"``).
-        mode: How to distribute ``label`` across sheet positions.
-
-            * ``"single"`` — exactly one label at (``start_row``, ``start_col``).
-              For partial-sheet reuse where the rest of the sheet was already
-              consumed on a previous print.
-            * ``"fill"`` (default) — repeat the label across every remaining
-              slot starting at (``start_row``, ``start_col``).
-        start_row: 1-indexed row on page 1 (1..tpl.rows).
-        start_col: 1-indexed column within that row (1..tpl.cols).
-        human_readable: If True (default), draw the 20-digit tracking
-            + routing ZIP as text directly below the barcode on each
-            label. Pass False to show bars only.
+        start_row: 1-indexed row on page 1 (1..tpl.rows). Page 2+ always
+            starts at row 1.
+        start_col: 1-indexed column within start_row (1..tpl.cols).
+            Page 2+ always starts at col 1.
+        human_readable: Draw the tiny numeric reference row under each
+            barcode. Pass False to show bars only.
     """
+    if not labels:
+        raise ValueError("labels must be non-empty")
     tpl = AVERY[part]
     if not 1 <= start_row <= tpl.rows:
         raise ValueError(f"start_row must be 1..{tpl.rows}, got {start_row}")
     if not 1 <= start_col <= tpl.cols:
         raise ValueError(f"start_col must be 1..{tpl.cols}, got {start_col}")
 
-    if mode == "single":
-        count = 1
-    else:  # "fill"
-        skip = (start_row - 1) * tpl.cols + (start_col - 1)
-        count = max(0, tpl.slots_per_sheet - skip)
+    pages: list[list[dict[str, object]]] = []
+    current: list[dict[str, object]] = []
+    row, col = start_row, start_col
+    for label in labels:
+        current.append(_label_dict(label, row, col, human_readable=human_readable))
+        col += 1
+        if col > tpl.cols:
+            col = 1
+            row += 1
+        if row > tpl.rows:
+            # Page full; overflow starts a new page at (1, 1).
+            pages.append(current)
+            current = []
+            row, col = 1, 1
+    if current:
+        pages.append(current)
 
-    labels = _positions_for_single_label(
-        label,
-        start_row,
-        start_col,
-        count,
-        cols=tpl.cols,
-        human_readable=human_readable,
-    )
-    # One page always — slot grid is bounded by start_{row,col}..tpl.slots_per_sheet.
-    pages = [labels] if labels else []
     html_str = _jinja.get_template("avery.html").render(tpl=tpl, pages=pages)
     HTML(string=html_str, base_url=str(_templates_dir())).write_pdf(out)

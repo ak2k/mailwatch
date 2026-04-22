@@ -48,6 +48,11 @@ from mailwatch.usps_api import IVMTRClient, NewApiClient
 # the ~4KB browser limit even after JSON + itsdangerous signature overhead.
 _MAX_FIELD_LEN = 500
 _MAX_SENDER_LEN = 1000
+# Batch upper bound for /generate. 30 fills the largest single Avery
+# sheet (5160/8160: 3 cols x 10 rows = 30 labels); bigger batches
+# paginate onto additional sheets. Cap prevents runaway serial
+# allocation if the form is tampered with or an agent sends a bad payload.
+_MAX_LABEL_COUNT = 30
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +153,11 @@ class GenerateForm(BaseModel):
     # populates it on a successful standardize and clears it on any
     # subsequent address edit.
     delivery_point: str | None = Field(default=None, pattern=r"^\d{2}$")
+    # How many distinct IMb serials to mint and label/envelope pages to
+    # render. 1 is the common single-letter flow; larger values batch-
+    # mail the same recipient with per-letter tracking (each physical
+    # piece gets its own serial so IV-MTR can tell scans apart).
+    label_count: int = Field(default=1, ge=1, le=_MAX_LABEL_COUNT)
 
 
 class TrackWSRequest(BaseModel):
@@ -233,15 +243,34 @@ class MailPiece:
     """The piece-of-mail identity held in the session cookie.
 
     Allocated by :func:`post_generate`, read by :func:`get_preview` and
-    :func:`get_download_pdf`. Stable across regen — the serial is minted
-    once and re-used for every output-option change.
+    :func:`get_download_pdf`. Stable across regen — the serials are
+    minted once and re-used for every output-option change.
+
+    ``serials`` / ``trackings`` are always non-empty tuples of the same
+    length. Most flows hold a single-element tuple (one letter). Batch
+    flows hold up to :data:`_MAX_LABEL_COUNT` distinct trackings, all
+    sharing one recipient + routing.
     """
 
     sender_address: str
     recipient: dict[str, Any]
-    serial: int
-    tracking: str
+    serials: tuple[int, ...]
+    trackings: tuple[str, ...]
     routing: str
+
+    @property
+    def serial(self) -> int:
+        """First serial — used for single-letter tracking URLs and display."""
+        return self.serials[0]
+
+    @property
+    def tracking(self) -> str:
+        """First tracking — used when a single IMb is needed for display."""
+        return self.trackings[0]
+
+    @property
+    def count(self) -> int:
+        return len(self.serials)
 
     @property
     def recipient_zip(self) -> str:
@@ -340,7 +369,7 @@ async def _standardize_for_generate(
     fresh_dp: str | None = None
     if std.additionalInfo and std.additionalInfo.deliveryPoint:
         candidate = std.additionalInfo.deliveryPoint
-        if len(candidate) == 2 and candidate.isdigit():
+        if len(candidate) == _DELIVERY_POINT_LEN and candidate.isdigit():
             fresh_dp = candidate
     return standardized, fresh_dp
 
@@ -357,6 +386,7 @@ async def post_generate(
     recipient_company: Annotated[str | None, Form()] = None,
     recipient_address2: Annotated[str | None, Form()] = None,
     delivery_point: Annotated[str | None, Form()] = None,
+    label_count: Annotated[int, Form()] = 1,
     settings: Settings = Depends(get_settings_dep),
     locked: tuple[sqlite3.Connection, asyncio.Lock] = Depends(get_db_locked),
     new_api: NewApiClient = Depends(get_new_api),
@@ -390,6 +420,7 @@ async def post_generate(
             recipient_zip=recipient_zip,
             # Empty-string from form → None so Pydantic's pattern skips.
             delivery_point=delivery_point or None,
+            label_count=label_count,
         )
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
@@ -398,25 +429,29 @@ async def post_generate(
 
     conn, lock = locked
     bucket = _day_bucket()
-    serial: int = await _db_call(lock, db.next_serial, conn, bucket)
+    serials: list[int] = await _db_call(lock, db.next_serials, conn, bucket, form.label_count)
 
-    tracking = _build_tracking(settings, serial)
+    trackings: list[str] = [_build_tracking(settings, s) for s in serials]
     routing = _build_routing(str(recipient["zip"]), effective_dp)
-    # Validate encoding end-to-end — raises ValueError on any out-of-range field.
-    imb.encode(
-        settings.BARCODE_ID,
-        settings.SRV_TYPE,
-        settings.MAILER_ID,
-        serial,
-        routing,
-    )
+    # Validate every encoding end-to-end — any out-of-range serial fails
+    # here rather than at /download/pdf time.
+    for serial, tracking in zip(serials, trackings, strict=True):
+        imb.encode(
+            settings.BARCODE_ID,
+            settings.SRV_TYPE,
+            settings.MAILER_ID,
+            serial,
+            routing,
+        )
+        del tracking  # tracking is derived for validation only; stored below
 
-    # Session holds the piece-of-mail identity (sender/recipient/serial).
-    # Output-format preferences ride on the URL, not the session.
+    # Session holds the piece-of-mail identity (sender/recipient + lists
+    # of serials/trackings for batch mailings). Output-format preferences
+    # ride on the URL, not the session.
     request.session["sender_address"] = form.sender_address
     request.session["recipient"] = recipient
-    request.session["serial"] = serial
-    request.session["tracking"] = tracking
+    request.session["serials"] = serials
+    request.session["trackings"] = trackings
     request.session["routing"] = routing
 
     # 303 = "see other" — turns the POST into a GET for the redirect target,
@@ -448,13 +483,31 @@ async def post_generate(
 
 
 def _require_session_piece(request: Request) -> MailPiece:
-    """Extract the session-held mail piece or raise 400."""
+    """Extract the session-held mail piece or raise 400.
+
+    Tolerates legacy single-serial session shape (pre-batch) so existing
+    browser sessions don't break on deploy: a session with scalar
+    ``serial`` / ``tracking`` keys is promoted to one-element tuples.
+    """
     recipient = request.session.get("recipient")
-    serial = request.session.get("serial")
-    tracking = request.session.get("tracking")
     routing = request.session.get("routing")
     sender_address = request.session.get("sender_address")
-    if not (recipient and serial is not None and tracking and sender_address):
+    serials_raw = request.session.get("serials")
+    trackings_raw = request.session.get("trackings")
+    if serials_raw is None or trackings_raw is None:
+        # Legacy pre-batch session: promote scalar to single-element list.
+        legacy_serial = request.session.get("serial")
+        legacy_tracking = request.session.get("tracking")
+        if legacy_serial is not None and legacy_tracking is not None:
+            serials_raw = [legacy_serial]
+            trackings_raw = [legacy_tracking]
+    if not (
+        recipient
+        and sender_address
+        and serials_raw
+        and trackings_raw
+        and len(serials_raw) == len(trackings_raw)
+    ):
         raise HTTPException(
             status_code=400,
             detail="No envelope in session; generate one first.",
@@ -462,8 +515,8 @@ def _require_session_piece(request: Request) -> MailPiece:
     return MailPiece(
         sender_address=sender_address,
         recipient=recipient,
-        serial=int(serial),
-        tracking=str(tracking),
+        serials=tuple(int(s) for s in serials_raw),
+        trackings=tuple(str(t) for t in trackings_raw),
         routing=str(routing or ""),
     )
 
@@ -482,7 +535,6 @@ class PreviewOptions:
     fmt: Literal["envelope", "avery"]
     size: str
     part: str
-    mode: Literal["single", "fill"]
     row: int
     col: int
     hr: bool
@@ -494,7 +546,6 @@ class PreviewOptions:
                 "fmt": self.fmt,
                 "size": self.size,
                 "part": self.part,
-                "mode": self.mode,
                 "row": self.row,
                 "col": self.col,
                 "hr": "1" if self.hr else "0",
@@ -522,11 +573,15 @@ def _preview_options(
     fmt: Literal["envelope", "avery"] = "envelope",
     size: str = DEFAULT_ENVELOPE,
     part: str = DEFAULT_AVERY,
-    mode: Literal["single", "fill"] = "fill",
     row: int = 1,
     col: int = 1,
 ) -> PreviewOptions:
-    """FastAPI dep: parse, validate, clamp the output-options query string."""
+    """FastAPI dep: parse, validate, clamp the output-options query string.
+
+    The old ``mode`` field (single vs fill-same-serial) is gone — label
+    count is now set at /generate time via ``label_count``, so the
+    preview page just places ``piece.count`` labels starting at (row, col).
+    """
     if size not in ENVELOPES:
         raise HTTPException(status_code=400, detail=f"unknown envelope size: {size}")
     if part not in AVERY:
@@ -539,7 +594,6 @@ def _preview_options(
         fmt=fmt,
         size=size,
         part=part,
-        mode=mode,
         row=clamped_row,
         col=clamped_col,
         hr=hr_on,
@@ -562,16 +616,26 @@ async def get_preview(
     tpl = AVERY[opts.part]
     pdf_url = f"/download/pdf?{opts.query_string()}"
     tracking_url = f"/tracking?serial={piece.serial}&zip={piece.recipient_zip}"
+    # Per-tracking URLs so a batch user can open any one letter's page
+    # from the confirmation panel. List order matches piece.trackings.
+    tracking_urls = [
+        {
+            "serial": s,
+            "url": f"/tracking?serial={s}&zip={piece.recipient_zip}",
+        }
+        for s in piece.serials
+    ]
     return templates.TemplateResponse(
         request,
         "preview.html",
         {
             "serial": piece.serial,
+            "count": piece.count,
+            "tracking_urls": tracking_urls,
             "recipient_zip": piece.recipient_zip,
             "fmt": opts.fmt,
             "size": opts.size,
             "part": opts.part,
-            "mode": opts.mode,
             "row": opts.row,
             "col": opts.col,
             "hr": opts.hr,
@@ -590,37 +654,59 @@ async def get_download_pdf(
     piece: MailPiece = Depends(_require_session_piece),
     opts: PreviewOptions = Depends(_preview_options),
 ) -> Response:
-    """Render the session's mail piece as a PDF using the given options."""
+    """Render the session's mail piece(s) as a PDF using the given options.
+
+    For batch flows (``piece.count > 1``) the rendered PDF contains N
+    envelopes (one per page) or N labels (paginated across Avery sheets
+    starting at the chosen (row, col) slot), each carrying its own
+    tracking from ``piece.trackings``.
+    """
     buf = io.BytesIO()
     if opts.fmt == "envelope":
+        envelopes: list[pdf.EnvelopeData] = [
+            {
+                "sender": piece.sender_lines(),
+                "recipient": piece.recipient_lines(),
+                "tracking": t,
+                "routing": piece.routing,
+            }
+            for t in piece.trackings
+        ]
         await asyncio.to_thread(
             pdf.render_envelope,
-            piece.sender_lines(),
-            piece.recipient_lines(),
-            piece.tracking,
-            piece.routing,
+            envelopes,
             buf,
             envelope_size=opts.size,
             human_readable=opts.hr,
         )
-        filename = f"envelope-{piece.serial}.pdf"
+        filename = (
+            f"envelope-{piece.serial}.pdf"
+            if piece.count == 1
+            else f"envelope-{piece.serial}-x{piece.count}.pdf"
+        )
     else:
-        label: pdf.LabelData = {
-            "recipient": piece.recipient_lines(),
-            "tracking": piece.tracking,
-            "routing": piece.routing,
-        }
+        labels: list[pdf.LabelData] = [
+            {
+                "recipient": piece.recipient_lines(),
+                "tracking": t,
+                "routing": piece.routing,
+            }
+            for t in piece.trackings
+        ]
         await asyncio.to_thread(
             pdf.render_avery,
-            label,
+            labels,
             buf,
             part=opts.part,
-            mode=opts.mode,
             start_row=opts.row,
             start_col=opts.col,
             human_readable=opts.hr,
         )
-        filename = f"avery-{opts.part}-{piece.serial}.pdf"
+        filename = (
+            f"avery-{opts.part}-{piece.serial}.pdf"
+            if piece.count == 1
+            else f"avery-{opts.part}-{piece.serial}-x{piece.count}.pdf"
+        )
 
     return Response(
         content=buf.getvalue(),

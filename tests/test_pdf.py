@@ -7,6 +7,7 @@ IDs), so the invariants here are cheap and platform-independent:
 * Output is a syntactically valid PDF (magic + EOF).
 * Page dimensions match the spec.
 * Text block origins land where the spec says they should.
+* Batch flows emit the expected number of pages.
 
 Per-size WeasyPrint rendering is limited to 3 representative envelopes
 (smallest, default, largest); the remaining sizes are verified via pure
@@ -23,7 +24,12 @@ import pytest
 
 from mailwatch.avery import AVERY
 from mailwatch.layouts import ENVELOPES
-from mailwatch.pdf import LabelData, render_avery, render_envelope
+from mailwatch.pdf import (
+    EnvelopeData,
+    LabelData,
+    render_avery,
+    render_envelope,
+)
 
 _PT_PER_INCH = 72.0
 
@@ -41,6 +47,19 @@ def sender_lines() -> list[str]:
 @pytest.fixture
 def recipient_lines() -> list[str]:
     return ["JOHN DOE", "123 MAIN ST", "ANYTOWN NY 10001-2345"]
+
+
+@pytest.fixture
+def envelope(
+    sender_lines: list[str],
+    recipient_lines: list[str],
+) -> EnvelopeData:
+    return {
+        "sender": sender_lines,
+        "recipient": recipient_lines,
+        "tracking": "00040904164589000001",
+        "routing": "100012345",
+    }
 
 
 @pytest.fixture
@@ -99,75 +118,50 @@ def _text_emit_positions(blob: bytes) -> list[tuple[float, float, str]]:
     return out
 
 
+def _with_tracking(env: EnvelopeData, tracking: str) -> EnvelopeData:
+    return {**env, "tracking": tracking}
+
+
+def _with_label_tracking(lbl: LabelData, tracking: str) -> LabelData:
+    return {**lbl, "tracking": tracking}
+
+
 # --------------------------------------------------------------------------- #
 # Envelope                                                                    #
 # --------------------------------------------------------------------------- #
 
 
-def test_envelope_default_renders(
-    sender_lines: list[str],
-    recipient_lines: list[str],
-) -> None:
+def test_envelope_default_renders(envelope: EnvelopeData) -> None:
     buf = io.BytesIO()
-    render_envelope(
-        sender_lines,
-        recipient_lines,
-        tracking="00040904164589000001",
-        routing="100012345",
-        out=buf,
-    )
+    render_envelope([envelope], buf)
     blob = buf.getvalue()
     _assert_valid_pdf(blob)
     assert _page_count(blob) == 1
 
 
-def test_envelope_with_empty_routing(
-    sender_lines: list[str],
-    recipient_lines: list[str],
-) -> None:
+def test_envelope_with_empty_routing(envelope: EnvelopeData) -> None:
     """Routing is optional — empty string must still produce a valid PDF."""
     buf = io.BytesIO()
-    render_envelope(
-        sender_lines,
-        recipient_lines,
-        tracking="00040904164589000001",
-        routing="",
-        out=buf,
-    )
+    render_envelope([{**envelope, "routing": ""}], buf)
     _assert_valid_pdf(buf.getvalue())
 
 
-def test_envelope_rejects_bad_tracking_length(
-    sender_lines: list[str],
-    recipient_lines: list[str],
-) -> None:
+def test_envelope_rejects_bad_tracking_length(envelope: EnvelopeData) -> None:
     with pytest.raises(ValueError, match="20 digits"):
-        render_envelope(
-            sender_lines,
-            recipient_lines,
-            tracking="12345",
-            routing="100012345",
-            out=io.BytesIO(),
-        )
+        render_envelope([{**envelope, "tracking": "12345"}], io.BytesIO())
+
+
+def test_envelope_empty_list_raises(envelope: EnvelopeData) -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        render_envelope([], io.BytesIO())
 
 
 # Smallest / default / largest envelope — the math-level dim checks live in
 # test_layouts; no need to render all 9 through WeasyPrint.
 @pytest.mark.parametrize("size", ["#6_3_4", "#10", "A10"])
-def test_envelope_page_dims_match_spec(
-    size: str,
-    sender_lines: list[str],
-    recipient_lines: list[str],
-) -> None:
+def test_envelope_page_dims_match_spec(size: str, envelope: EnvelopeData) -> None:
     buf = io.BytesIO()
-    render_envelope(
-        sender_lines,
-        recipient_lines,
-        tracking="00040904164589000001",
-        routing="100012345",
-        out=buf,
-        envelope_size=size,
-    )
+    render_envelope([envelope], buf, envelope_size=size)
     blob = buf.getvalue()
     _assert_valid_pdf(blob)
     assert _page_count(blob) == 1
@@ -176,8 +170,7 @@ def test_envelope_page_dims_match_spec(
 
 
 def test_envelope_text_emits_start_inside_declared_blocks(
-    sender_lines: list[str],
-    recipient_lines: list[str],
+    envelope: EnvelopeData,
 ) -> None:
     """Every text run on the envelope begins inside the sender or recipient block.
 
@@ -187,13 +180,7 @@ def test_envelope_text_emits_start_inside_declared_blocks(
     barcode' regression class.
     """
     buf = io.BytesIO()
-    render_envelope(
-        sender_lines,
-        recipient_lines,
-        tracking="00040904164589000001",
-        routing="100012345",
-        out=buf,
-    )
+    render_envelope([envelope], buf)
     spec = ENVELOPES["#10"]
     sender_x_pt = spec.sender.x * _PT_PER_INCH
     sender_right_pt = (spec.sender.x + spec.sender.w) * _PT_PER_INCH
@@ -225,30 +212,34 @@ def test_envelope_long_sender_still_renders_single_page(
     recipient_lines: list[str],
 ) -> None:
     """A 500-char sender line clips via CSS max-width+overflow; PDF stays one page."""
-    very_long = ["X" * 500]
+    env: EnvelopeData = {
+        "sender": ["X" * 500],
+        "recipient": recipient_lines,
+        "tracking": "00040904164589000001",
+        "routing": "100012345",
+    }
     buf = io.BytesIO()
-    render_envelope(
-        very_long,
-        recipient_lines,
-        tracking="00040904164589000001",
-        routing="100012345",
-        out=buf,
-    )
+    render_envelope([env], buf)
     blob = buf.getvalue()
     _assert_valid_pdf(blob)
     assert _page_count(blob) == 1
 
 
-def test_envelope_unknown_size_raises() -> None:
+def test_envelope_unknown_size_raises(envelope: EnvelopeData) -> None:
     with pytest.raises(KeyError):
-        render_envelope(
-            ["X"],
-            ["Y"],
-            tracking="00040904164589000001",
-            routing="",
-            out=io.BytesIO(),
-            envelope_size="#99",
-        )
+        render_envelope([envelope], io.BytesIO(), envelope_size="#99")
+
+
+def test_envelope_batch_emits_one_page_per_envelope(
+    envelope: EnvelopeData,
+) -> None:
+    """N envelopes in → N-page PDF out, each with its own tracking."""
+    envelopes = [_with_tracking(envelope, f"000409041645890000{i:02d}") for i in range(1, 6)]
+    buf = io.BytesIO()
+    render_envelope(envelopes, buf)
+    blob = buf.getvalue()
+    _assert_valid_pdf(blob)
+    assert _page_count(blob) == 5
 
 
 # --------------------------------------------------------------------------- #
@@ -256,33 +247,39 @@ def test_envelope_unknown_size_raises() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_avery_single_one_label(label: LabelData) -> None:
+def test_avery_one_label(label: LabelData) -> None:
+    """Single label at an arbitrary slot → one page."""
     buf = io.BytesIO()
-    render_avery(label, buf, mode="single", start_row=3, start_col=2)
+    render_avery([label], buf, start_row=3, start_col=2)
     blob = buf.getvalue()
     _assert_valid_pdf(blob)
     assert _page_count(blob) == 1
 
 
-def test_avery_fill_default_fills_whole_sheet(label: LabelData) -> None:
-    """Fill on an 8163 sheet → 10 labels on one page."""
+def test_avery_fills_full_sheet(label: LabelData) -> None:
+    """10 labels on 8163 (2x5) → 1 page."""
+    labels = [_with_label_tracking(label, f"000409041645890000{i:02d}") for i in range(10)]
     buf = io.BytesIO()
-    render_avery(label, buf, mode="fill")
+    render_avery(labels, buf)
     blob = buf.getvalue()
     _assert_valid_pdf(blob)
     assert _page_count(blob) == 1
 
 
-def test_avery_fill_with_skip(label: LabelData) -> None:
+def test_avery_overflows_to_second_sheet(label: LabelData) -> None:
+    """11 labels on 8163 (10 slots) → 2 pages, overflow starts at (1,1)."""
+    labels = [_with_label_tracking(label, f"000409041645890000{i:02d}") for i in range(11)]
     buf = io.BytesIO()
-    render_avery(label, buf, mode="fill", start_row=2, start_col=1)
-    _assert_valid_pdf(buf.getvalue())
+    render_avery(labels, buf)
+    blob = buf.getvalue()
+    _assert_valid_pdf(blob)
+    assert _page_count(blob) == 2
 
 
-def test_avery_fill_at_last_slot_produces_one_label(label: LabelData) -> None:
-    """Start at the final slot (row 5, col 2 on 8163) → exactly one label, one page."""
+def test_avery_last_slot_fits_one_label(label: LabelData) -> None:
+    """Start at the final slot (row 5, col 2 on 8163) with exactly 1 label → 1 page."""
     buf = io.BytesIO()
-    render_avery(label, buf, mode="fill", start_row=5, start_col=2)
+    render_avery([label], buf, start_row=5, start_col=2)
     blob = buf.getvalue()
     _assert_valid_pdf(blob)
     assert _page_count(blob) == 1
@@ -291,9 +288,14 @@ def test_avery_fill_at_last_slot_produces_one_label(label: LabelData) -> None:
 def test_avery_rejects_out_of_range_start_position(label: LabelData) -> None:
     # 8163 is 2 cols x 5 rows — anything beyond that must fail at the library boundary.
     with pytest.raises(ValueError, match="start_row must be"):
-        render_avery(label, io.BytesIO(), start_row=0)
+        render_avery([label], io.BytesIO(), start_row=0)
     with pytest.raises(ValueError, match="start_col must be"):
-        render_avery(label, io.BytesIO(), start_col=3)
+        render_avery([label], io.BytesIO(), start_col=3)
+
+
+def test_avery_empty_list_raises(label: LabelData) -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        render_avery([], io.BytesIO())
 
 
 # Cover one part from each geometry family (shipping / address / return-address)
@@ -301,7 +303,7 @@ def test_avery_rejects_out_of_range_start_position(label: LabelData) -> None:
 @pytest.mark.parametrize("part", ["5160", "5163", "5167", "8163"])
 def test_avery_parts_smoke(label: LabelData, part: str) -> None:
     buf = io.BytesIO()
-    render_avery(label, buf, part=part, mode="fill")
+    render_avery([label], buf, part=part)
     blob = buf.getvalue()
     _assert_valid_pdf(blob)
     tpl = AVERY[part]
@@ -310,12 +312,12 @@ def test_avery_parts_smoke(label: LabelData, part: str) -> None:
 
 def test_avery_rejects_unknown_part(label: LabelData) -> None:
     with pytest.raises(KeyError):
-        render_avery(label, io.BytesIO(), part="9999")
+        render_avery([label], io.BytesIO(), part="9999")
 
 
 def test_avery_part_with_smaller_grid_rejects_out_of_range(label: LabelData) -> None:
     """5167 is a 4x20 grid — row=21 must be rejected, col=5 must be rejected."""
     with pytest.raises(ValueError, match="start_row must be"):
-        render_avery(label, io.BytesIO(), part="5167", start_row=21)
+        render_avery([label], io.BytesIO(), part="5167", start_row=21)
     with pytest.raises(ValueError, match="start_col must be"):
-        render_avery(label, io.BytesIO(), part="5167", start_col=5)
+        render_avery([label], io.BytesIO(), part="5167", start_col=5)

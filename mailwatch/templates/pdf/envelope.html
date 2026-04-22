@@ -100,19 +100,21 @@ body {
 
 </style>
 <body>
+    {% for env in envelopes %}
     <div class="envelope">
         <div class="sender">
-            {% for line in sender_lines %}{{ line }}<br/>{% endfor %}
+            {% for line in env.sender_lines %}{{ line }}<br/>{% endfor %}
         </div>
         <div class="recipient">
             <div class="recipient-lines">
-                {% for line in recipient_lines %}{{ line }}<br/>{% endfor %}
+                {% for line in env.recipient_lines %}{{ line }}<br/>{% endfor %}
             </div>
         </div>
         <div class="barcode">
-            {% if human_readable %}<div class="hr-digits">{{ human_readable_text }}</div>{% endif %}
-            <div class="bars">{{ barcode_bars }}</div>
+            {% if human_readable %}<div class="hr-digits">{{ env.human_readable_text }}</div>{% endif %}
+            <div class="bars">{{ env.barcode_bars }}</div>
         </div>
     </div>
+    {% endfor %}
 </body>
 </html>

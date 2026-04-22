@@ -127,6 +127,27 @@ def next_serial(conn: sqlite3.Connection, day_bucket: int) -> int:
     return counter
 
 
+def next_serials(conn: sqlite3.Connection, day_bucket: int, count: int) -> list[int]:
+    """Atomically allocate ``count`` consecutive serials from ``day_bucket``.
+
+    One UPSERT bumps the counter by ``count`` under SQLite's write lock,
+    then returns the range the caller owns (``[first, ..., last]``). Two
+    concurrent callers never get overlapping ranges.
+    """
+    if count < 1:
+        raise ValueError(f"count must be >= 1, got {count}")
+    row = conn.execute(
+        "INSERT INTO serial_counters (day_bucket, counter) VALUES (?, ?) "
+        "ON CONFLICT(day_bucket) DO UPDATE SET "
+        "counter = counter + excluded.counter, updated_at = unixepoch() "
+        "RETURNING counter",
+        (day_bucket, count),
+    ).fetchone()
+    last: int = row[0]
+    first = last - count + 1
+    return list(range(first, last + 1))
+
+
 # --- scan events -------------------------------------------------------------
 
 

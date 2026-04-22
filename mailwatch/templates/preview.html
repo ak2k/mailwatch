@@ -6,14 +6,30 @@
 <h1>Preview &amp; download</h1>
 
 <section class="callout">
-  <p class="callout-lead">Save these to track your letter:</p>
-  <p class="tracking-id">
-    Tracking: <code>{{ serial }}</code> / <code>{{ recipient_zip }}</code>
-  </p>
-  <p class="muted">
-    Changing output options below regenerates the PDF without touching the
-    tracking number.
-  </p>
+  {% if count == 1 %}
+    <p class="callout-lead">Save these to track your letter:</p>
+    <p class="tracking-id">
+      Tracking: <code>{{ serial }}</code> / <code>{{ recipient_zip }}</code>
+    </p>
+    <p class="muted">
+      Changing output options below regenerates the PDF without touching the
+      tracking number.
+    </p>
+  {% else %}
+    <p class="callout-lead">
+      Batch of {{ count }} letters &middot; each has its own tracking number:
+    </p>
+    <ul class="tracking-list">
+      {% for item in tracking_urls %}
+      <li><code>{{ item.serial }}</code>
+        <a href="{{ item.url }}">track</a></li>
+      {% endfor %}
+    </ul>
+    <p class="muted">
+      Changing output options regenerates the PDF; the {{ count }}
+      tracking numbers are preserved across every change.
+    </p>
+  {% endif %}
 </section>
 
 <section class="stack">
@@ -49,16 +65,6 @@
             {% endfor %}
           </select>
         </div>
-        <div class="field radios">
-          <label class="radio">
-            <input type="radio" name="mode" value="fill" {% if mode == 'fill' %}checked{% endif %}>
-            Fill — repeat the recipient into every remaining slot
-          </label>
-          <label class="radio">
-            <input type="radio" name="mode" value="single" {% if mode == 'single' %}checked{% endif %}>
-            Single — one label at (row, column)
-          </label>
-        </div>
         <div class="grid-2">
           <div class="field">
             <label for="row">Start row</label>
@@ -69,6 +75,10 @@
             <input type="number" id="col" name="col" min="1" max="{{ avery_max_col }}" value="{{ col }}">
           </div>
         </div>
+        <p class="muted">
+          {{ count }} label{{ "s" if count != 1 else "" }} will be placed
+          starting at (row, column); overflow rolls onto a second sheet.
+        </p>
       </div>
 
       <div class="field">
@@ -127,7 +137,7 @@
     }
     form.addEventListener('change', function (e) {
       syncPanels();
-      // Auto-submit on format/size/part/mode/hr changes. Skip row/col
+      // Auto-submit on format/size/part/hr changes. Skip row/col
       // (number inputs fire 'change' on blur, which is fine, but users
       // expect to type without it bouncing).
       if (e.target && (e.target.name === 'row' || e.target.name === 'col')) {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 from collections.abc import Iterator
 from pathlib import Path
@@ -189,7 +190,9 @@ def _routing_from_generate(client: TestClient, **form_overrides: Any) -> str:
     Patching the module-level imb.encode lets us observe what /generate
     actually feeds the IMb encoder without parsing compressed PDF bytes.
     """
-    with patch("mailwatch.routes.imb.encode", wraps=__import__("mailwatch.imb", fromlist=["encode"]).encode) as spy:
+    with patch(
+        "mailwatch.routes.imb.encode", wraps=__import__("mailwatch.imb", fromlist=["encode"]).encode
+    ) as spy:
         resp = client.post(
             "/generate",
             data=_valid_form(**form_overrides),
@@ -228,20 +231,14 @@ def test_generate_falls_back_to_form_zip_when_usps_fails(
 
     5-digit ZIP + no DP → 5-digit routing.
     """
-    client.app.state.new_api.validate_address = AsyncMock(
-        side_effect=RuntimeError("USPS down")
-    )
+    client.app.state.new_api.validate_address = AsyncMock(side_effect=RuntimeError("USPS down"))
     assert _routing_from_generate(client, recipient_zip="20500") == "20500"
 
 
 def test_generate_fallback_uses_form_zip_plus_4(client: TestClient) -> None:
     """USPS outage with ZIP+4 form input → 9-digit routing from the user's hyphen."""
-    client.app.state.new_api.validate_address = AsyncMock(
-        side_effect=RuntimeError("USPS down")
-    )
-    assert (
-        _routing_from_generate(client, recipient_zip="20500-0001") == "205000001"
-    )
+    client.app.state.new_api.validate_address = AsyncMock(side_effect=RuntimeError("USPS down"))
+    assert _routing_from_generate(client, recipient_zip="20500-0001") == "205000001"
 
 
 def test_generate_fallback_uses_form_delivery_point(client: TestClient) -> None:
@@ -252,26 +249,69 @@ def test_generate_fallback_uses_form_delivery_point(client: TestClient) -> None:
     clears delivery_point when ZIP is edited, so a form-carried DP reflects
     a previously-successful validate.
     """
-    client.app.state.new_api.validate_address = AsyncMock(
-        side_effect=RuntimeError("USPS down")
-    )
+    client.app.state.new_api.validate_address = AsyncMock(side_effect=RuntimeError("USPS down"))
     assert (
-        _routing_from_generate(
-            client, recipient_zip="20500-0001", delivery_point="23"
-        )
+        _routing_from_generate(client, recipient_zip="20500-0001", delivery_point="23")
         == "20500000123"
     )
 
 
 def test_generate_fallback_drops_stale_dp_with_zip5(client: TestClient) -> None:
     """USPS outage + 5-digit ZIP + stale DP → 5-digit routing (DP dropped)."""
-    client.app.state.new_api.validate_address = AsyncMock(
-        side_effect=RuntimeError("USPS down")
+    client.app.state.new_api.validate_address = AsyncMock(side_effect=RuntimeError("USPS down"))
+    assert _routing_from_generate(client, recipient_zip="20500", delivery_point="23") == "20500"
+
+
+def test_generate_batch_mints_n_distinct_serials(client: TestClient) -> None:
+    """label_count=5 should allocate five distinct serials in one /generate."""
+    resp = client.post(
+        "/generate",
+        data=_valid_form(label_count="5"),
+        follow_redirects=False,
     )
-    assert (
-        _routing_from_generate(client, recipient_zip="20500", delivery_point="23")
-        == "20500"
+    assert resp.status_code == 303, resp.text
+    # /preview callout lists each tracking number when count > 1.
+    preview = client.get("/preview")
+    assert preview.status_code == 200
+    # The five serials should appear as distinct <code> entries.
+    body = preview.text
+    assert "Batch of 5 letters" in body
+    # 5 list items in the batch tracking-list (one per serial), distinct
+    # from the footer's "Track this letter" link which only points at the
+    # first serial.
+    assert body.count("<li><code>") == 5
+
+
+def test_generate_batch_rejects_over_max(client: TestClient) -> None:
+    """label_count > _MAX_LABEL_COUNT (30) must 422."""
+    resp = client.post(
+        "/generate",
+        data=_valid_form(label_count="99"),
+        follow_redirects=False,
     )
+    assert resp.status_code == 422
+
+
+def test_generate_batch_rejects_zero(client: TestClient) -> None:
+    """label_count=0 has no meaningful interpretation; 422."""
+    resp = client.post(
+        "/generate",
+        data=_valid_form(label_count="0"),
+        follow_redirects=False,
+    )
+    assert resp.status_code == 422
+
+
+def test_download_pdf_envelope_batch_is_multipage(client: TestClient) -> None:
+    """5-letter envelope batch → 5-page PDF."""
+    import pypdf
+
+    _submit_generate(client, label_count="5")
+    resp = client.get("/download/pdf", params={"fmt": "envelope"})
+    assert resp.status_code == 200
+    assert resp.content.startswith(b"%PDF-")
+    reader = pypdf.PdfReader(io.BytesIO(resp.content))
+    assert len(reader.pages) == 5
 
 
 def test_generate_standardizes_session_recipient(client: TestClient) -> None:
@@ -372,7 +412,7 @@ def test_download_pdf_avery(client: TestClient) -> None:
     _submit_generate(client)
     resp = client.get(
         "/download/pdf",
-        params={"fmt": "avery", "part": "8163", "mode": "fill", "row": 2, "col": 1},
+        params={"fmt": "avery", "part": "8163", "row": 2, "col": 1},
     )
     assert resp.status_code == 200
     assert resp.content.startswith(b"%PDF-")
@@ -382,7 +422,7 @@ def test_download_pdf_avery_other_part(client: TestClient) -> None:
     _submit_generate(client)
     resp = client.get(
         "/download/pdf",
-        params={"fmt": "avery", "part": "5160", "mode": "fill"},
+        params={"fmt": "avery", "part": "5160"},
     )
     assert resp.status_code == 200
     assert resp.content.startswith(b"%PDF-")
@@ -472,9 +512,9 @@ def test_build_routing_unit() -> None:
 def test_preview_regen_keeps_same_serial(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Changing size / part / mode / hr must not mint a new IMb serial.
+    """Changing size / part / hr must not mint a new IMb serial.
 
-    Couples the test to the actual invariant ("``db.next_serial`` called
+    Couples the test to the actual invariant ("``db.next_serials`` called
     exactly once") instead of a regex on the rendered tracking URL — so
     a later change to the tracking-link HTML format doesn't silently
     pass this check.
@@ -482,24 +522,24 @@ def test_preview_regen_keeps_same_serial(
     from mailwatch import db, routes
 
     call_count = {"n": 0}
-    real_next_serial = db.next_serial
+    real_next_serials = db.next_serials
 
-    def counting_next_serial(conn: Any, bucket: int) -> int:
+    def counting_next_serials(conn: Any, bucket: int, count: int) -> list[int]:
         call_count["n"] += 1
-        return real_next_serial(conn, bucket)
+        return real_next_serials(conn, bucket, count)
 
-    monkeypatch.setattr(routes.db, "next_serial", counting_next_serial)
+    monkeypatch.setattr(routes.db, "next_serials", counting_next_serials)
 
     _submit_generate(client)
-    assert call_count["n"] == 1, "initial /generate should allocate exactly one serial"
+    assert call_count["n"] == 1, "initial /generate should allocate exactly one batch"
 
-    # N regen clicks across envelope sizes + Avery parts — none should re-call next_serial.
+    # N regen clicks across envelope sizes + Avery parts — none should re-allocate.
     for params in [
         {"fmt": "envelope", "size": "A7"},
         {"fmt": "envelope", "size": "#11"},
         {"fmt": "envelope", "size": "#6_3_4"},
         {"fmt": "avery", "part": "5163"},
-        {"fmt": "avery", "part": "8163", "mode": "single"},
+        {"fmt": "avery", "part": "8163"},
         {"fmt": "envelope", "hr": "0"},
     ]:
         resp = client.get("/preview", params=params)
