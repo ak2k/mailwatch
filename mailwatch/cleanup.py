@@ -9,10 +9,10 @@ Purges:
 * ``address_cache`` older than 1 year — USPS delivery-point data does
   drift, so let entries re-standardize annually.
 
-After the DELETEs the script runs ``PRAGMA wal_checkpoint(TRUNCATE)`` to
-bound WAL growth. It deliberately does *not* run ``VACUUM`` — that
-rewrites the DB file and invalidates the Litestream generation, forcing
-a full re-snapshot. See :func:`mailwatch.db.purge_old` for the rationale.
+Does *not* run ``VACUUM`` (rewrites the DB file and invalidates the
+Litestream generation) or ``PRAGMA wal_checkpoint`` (races with
+Litestream's own WAL management — see :func:`mailwatch.db.purge_old`).
+WAL growth is bounded by Litestream 0.5.x's own checkpoint thresholds.
 """
 
 from __future__ import annotations

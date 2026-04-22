@@ -327,11 +327,17 @@ def purge_old(
     serial_counters_ttl_hours: int = 48,
     address_cache_ttl_days: int = 365,
 ) -> dict[str, int]:
-    """Delete rows past their TTLs and checkpoint the WAL.
+    """Delete rows past their TTLs.
 
-    Never runs ``VACUUM`` — that would rewrite the DB and invalidate the
-    Litestream generation, forcing a full re-snapshot. ``PRAGMA
-    wal_checkpoint(TRUNCATE)`` is safe and keeps the WAL bounded.
+    Intentionally does not run ``VACUUM`` (that would rewrite the DB and
+    invalidate the Litestream generation) or ``PRAGMA wal_checkpoint`` of
+    any mode. Litestream holds a read lock specifically to prevent
+    application-side checkpoints; app-level TRUNCATE either gets blocked
+    by that lock or races with Litestream's own checkpoint state and
+    causes the replica to lose WAL position (tracked upstream in
+    Litestream issues #521, #547, #58). Litestream 0.5.x manages WAL
+    growth itself via `min-checkpoint-page-count` and `truncate-page-n`;
+    leaving it alone is the documented best practice.
 
     Returns a dict of ``{table: rows_deleted}``.
     """
@@ -347,10 +353,8 @@ def purge_old(
         "DELETE FROM address_cache WHERE cached_at < unixepoch() - ? * 86400",
         (address_cache_ttl_days,),
     )
-    deleted = {
+    return {
         "scan_events": scan_cur.rowcount,
         "serial_counters": serial_cur.rowcount,
         "address_cache": cache_cur.rowcount,
     }
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    return deleted

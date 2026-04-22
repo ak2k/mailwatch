@@ -184,7 +184,7 @@ def test_defaults_populated_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings()
     assert settings.SRV_TYPE == 40
     assert settings.BARCODE_ID == 0
-    assert settings.RATE_LIMIT_PER_HOUR == 50
+    assert settings.RATE_LIMIT_PER_HOUR == 1000
     assert settings.USPS_FEED_CIDRS == ["56.0.0.0/8"]
     # DB_PATH relative default resolves to cwd-anchored absolute path.
     assert settings.DB_PATH.is_absolute()

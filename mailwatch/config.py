@@ -52,8 +52,13 @@ class Settings(BaseSettings):
     # Storage
     DB_PATH: Path = Field(Path("./mailwatch.db"))
 
-    # Rate limiting
-    RATE_LIMIT_PER_HOUR: int = Field(50, ge=1, le=10000)
+    # Rate limiting for apis.usps.com (NewApiClient). 1000/hr gives ~5x
+    # headroom over the USPS Addresses daily average (20,000/day = ~833/hr)
+    # while still catching runaway loops or retry storms that could burn
+    # daily quota within minutes. Tracking (2M/day) is not governed by
+    # this limiter — the semaphore only wraps NewApiClient per app.py
+    # lifespan wiring.
+    RATE_LIMIT_PER_HOUR: int = Field(1000, ge=1, le=10000)
 
     # IV-MTR pull-poll daemon (read by `python -m mailwatch.poll`)
     POLL_LOOKBACK_DAYS: int = Field(14, ge=1, le=365)
