@@ -118,13 +118,23 @@
     if (!validateBtn) { return; }
 
     validateBtn.addEventListener('click', function () {
+      // The USPS AddressRequest shape wants ZIPCode (5 digits) and
+      // ZIPPlus4 (4 digits) as separate fields. The ZIP input accepts
+      // either "12345" or "12345-6789" — split before POSTing so a
+      // ZIP+4 (including one the auto-fill just wrote back) doesn't
+      // 422 the request against Pydantic's 5-digit ZIPCode pattern.
+      var zipRaw = document.getElementById('recipient_zip').value.trim();
+      var zipMatch = zipRaw.match(/^(\d{5})(?:-?(\d{4}))?$/);
+      var zipCode = zipMatch ? zipMatch[1] : zipRaw;
+      var zipPlus4 = zipMatch && zipMatch[2] ? zipMatch[2] : null;
       var payload = {
         firm: document.getElementById('recipient_company').value,
         streetAddress: document.getElementById('recipient_street').value,
         secondaryAddress: document.getElementById('recipient_address2').value,
         city: document.getElementById('recipient_city').value,
         state: document.getElementById('recipient_state').value,
-        ZIPCode: document.getElementById('recipient_zip').value
+        ZIPCode: zipCode,
+        ZIPPlus4: zipPlus4
       };
 
       validateResult.hidden = false;
