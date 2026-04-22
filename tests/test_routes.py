@@ -594,6 +594,53 @@ def test_validate_address_invalid_zip_is_422(client: TestClient) -> None:
     assert resp.status_code == 422
 
 
+def test_validate_address_rejects_zip_plus_4_as_zipcode(client: TestClient) -> None:
+    """ZIPCode must be exactly 5 digits; ZIP+4 belongs in ZIPPlus4.
+
+    Regression guard for the db6d139 fix: after a successful validate,
+    the auto-fill writes 'NNNNN-NNNN' back to the recipient_zip input.
+    A second Validate click must split the value before POSTing — if
+    the JS ever regresses and sends the concatenated string, the server
+    correctly 422s. This test pins the contract so nobody "fixes" it
+    by loosening the server pattern without understanding why.
+    """
+    body = {
+        "streetAddress": "1600 Pennsylvania Ave NW",
+        "city": "Washington",
+        "state": "DC",
+        "ZIPCode": "20500-0005",  # wrong shape; belongs in ZIPCode + ZIPPlus4
+    }
+    resp = client.post("/validate_address", json=body)
+    assert resp.status_code == 422
+
+
+def test_validate_address_accepts_split_zip_plus_4(client: TestClient) -> None:
+    """The correct post-auto-fill shape: ZIPCode=5 digits + ZIPPlus4=4 digits."""
+    body = {
+        "streetAddress": "1600 Pennsylvania Ave NW",
+        "city": "Washington",
+        "state": "DC",
+        "ZIPCode": "20500",
+        "ZIPPlus4": "0005",
+    }
+    resp = client.post("/validate_address", json=body)
+    assert resp.status_code == 200
+
+
+def test_index_validate_js_normalises_zip_plus_4(client: TestClient) -> None:
+    """The validate-button JS must split ZIP+4 before POST.
+
+    Brittle substring check on the rendered template, but cheap and
+    specific: catches the regression where JS sends ZIPCode='NNNNN-NNNN'
+    and the server 422s. pytest otherwise never exercises the JS layer.
+    """
+    body = client.get("/").text
+    # The fix: a regex that captures 5-digit ZIP + optional 4-digit +4,
+    # and a payload that sends ZIPPlus4 as a separate field.
+    assert r"\d{5}" in body, "validate JS must extract a 5-digit ZIPCode"
+    assert "ZIPPlus4:" in body, "validate JS must send ZIPPlus4 as a separate field"
+
+
 def test_validate_address_upstream_error_is_502(client: TestClient, settings: Settings) -> None:
     app = client.app
     app.state.new_api.validate_address = AsyncMock(side_effect=RuntimeError("USPS down"))
