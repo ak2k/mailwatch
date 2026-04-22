@@ -45,14 +45,19 @@ body {
 .usps-barcode {
     font-family: "USPSIMBStandard";
     font-size: 16pt;
-    margin-bottom: 0.1in;
+    /* No gap below — HR digit row tucks directly under the bars and is
+       visually part of the barcode cluster, separated from the recipient
+       by the HR row's own margin-bottom. */
+    margin-bottom: 0;
 }
 
 .barcode-humanreadable {
-    /* Matches envelope.html's .hr-digits (7pt). Keeps the human-readable
-       row as a quiet reference line rather than visually competing with
-       the 11pt recipient address below. */
-    font-size: 7pt;
+    /* Small reference row: sits tight under the bars, then adds space
+       before the recipient address so the numeric code reads as part
+       of the barcode (not the address). */
+    font-size: 6pt;
+    line-height: 1;
+    margin-bottom: 0.12in;
 }
 
 .recipient-text {

@@ -91,7 +91,11 @@ body {
 .hr-digits {
     font-family: "DejaVu Serif", serif;
     font-size: 7pt;
-    margin-bottom: 1pt;
+    /* line-height:1 + margin-bottom:0 pulls the HR row snug against
+       the bars below. Default line-height would leave ~2pt of leading
+       that reads as an awkward gap between the two. */
+    line-height: 1;
+    margin-bottom: 0;
 }
 
 </style>
