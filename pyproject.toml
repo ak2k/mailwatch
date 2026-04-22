@@ -27,8 +27,7 @@ dependencies = [
     "pydantic-settings>=2.6,<3",
     "jinja2>=3.1,<4",
     "itsdangerous>=2.2,<3",
-    "reportlab>=4.2,<5",
-    "pylabels2>=1.4.4,<2",
+    "weasyprint>=63.0,<67",
     "python-multipart>=0.0.19,<1",
 ]
 
@@ -111,7 +110,7 @@ init_typed = true
 warn_required_dynamic_aliases = true
 
 [[tool.mypy.overrides]]
-module = ["reportlab.*", "pylabels.*", "labels.*"]
+module = ["weasyprint.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
@@ -129,7 +128,6 @@ addopts = [
 ]
 filterwarnings = [
     "error",
-    "ignore::DeprecationWarning:reportlab.*",
     "ignore::pydantic.PydanticDeprecatedSince20",
 ]
 markers = [

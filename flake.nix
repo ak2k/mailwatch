@@ -48,6 +48,17 @@
           pkgs = nixpkgs.legacyPackages.${system};
           workspace = uv2nix.lib.workspace.loadWorkspace { workspaceRoot = ./.; };
           overlay = workspace.mkPyprojectOverlay { sourcePreference = "wheel"; };
+
+          # Swap uv2nix's weasyprint wheel for nixpkgs's source build —
+          # nixpkgs patches `weasyprint/text/ffi.py` to hardcode absolute
+          # Nix store paths for libpango, libcairo, libgobject,
+          # libharfbuzz, and libfontconfig (see
+          # pkgs/development/python-modules/weasyprint/library-paths.patch).
+          # Going through that derivation gets the dlopen calls to
+          # resolve without LD_LIBRARY_PATH plumbing on our end.
+          weasyprintOverride = final: _prev: {
+            weasyprint = pkgs.python312Packages.weasyprint;
+          };
         in
         {
           inherit workspace;
@@ -59,6 +70,7 @@
                 nixpkgs.lib.composeManyExtensions [
                   pyproject-build-systems.overlays.wheel
                   overlay
+                  weasyprintOverride
                 ]
               );
         };

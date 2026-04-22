@@ -1,128 +1,48 @@
-"""PDF rendering for USPS-compliant #10 envelopes and Avery 8163 label sheets.
+"""PDF rendering for USPS-compliant #10 envelopes and Avery 8163 sheets.
 
-Two public entry points, both synchronous — callers that live in an async
-context are expected to wrap them in :func:`asyncio.to_thread`:
+Backed by WeasyPrint + Jinja2 against HTML templates in
+``mailwatch/templates/pdf/``. The templates embed the USPSIMBStandard
+TrueType font (base64 ``@font-face``) and render the IMb by dropping a
+65-character ``F``/``A``/``D``/``T`` string into a ``<span>`` with that
+font — each glyph is the appropriate ascender / descender / full /
+tracker bar. Layout is plain CSS (flexbox column on the envelope;
+absolute positioning per (row, col) on Avery), so coordinate changes
+are edits to the template, not Python.
 
-- :func:`render_envelope` — single #10 business envelope (9.5" x 4.125")
-  with USPS-B-3200 / DMM 202 compliant layout: sender block top-left,
-  recipient block inside the OCR Read Area, 4-state IMb barcode at the
-  bottom-right corner and optional human-readable tracking-plus-routing
-  line directly above the bars.
-- :func:`render_avery8163` — 2 x 5 grid of 4" x 2" shipping labels on US
-  Letter using ``pylabels2`` (imported as :mod:`pylabels`, despite the
-  PyPI distribution name). Supports partial-page starts (``start_row`` /
-  ``start_col``) for resuming from a sheet that already had labels peeled
-  off.
-
-Notes on dependency quirks:
-
-* The PyPI distribution is ``pylabels2`` but it installs as the ``pylabels``
-  top-level module. This is a known GPL-continuation fork of the original
-  ``pylabels`` package.
-* :class:`~reportlab.graphics.barcode.usps4s.USPS_4State` is a
-  :class:`~reportlab.platypus.flowables.Flowable`, not a graphics
-  :class:`~reportlab.graphics.shapes.Drawing`. Its :meth:`draw` method
-  calls ``self.canv.rect(...)`` for each of the 65 bars. To embed the
-  barcode in a pylabels drawing (which gives us a ``Drawing`` object, not
-  a canvas) we provide a minimal "shape recorder" shim that records each
-  ``rect`` call as a :class:`~reportlab.graphics.shapes.Rect` in a
-  :class:`~reportlab.graphics.shapes.Group`. This lets us compose the
-  barcode into the Avery label drawing without touching a real canvas.
+The two public entry points are synchronous — FastAPI callers wrap
+them in :func:`asyncio.to_thread`. They mirror the pre-WeasyPrint API
+shape (``render_envelope(sender, recipient, tracking, routing, out)``
+and ``render_avery8163(labels_data, out, *, mode, start_row, start_col)``)
+so the routes layer didn't need changes.
 """
 
 from __future__ import annotations
 
-from typing import Any, BinaryIO, TypedDict
+from importlib import resources
+from pathlib import Path
+from typing import BinaryIO, Literal, TypedDict
 
-import pylabels
-from reportlab.graphics import shapes
-from reportlab.graphics.barcode.usps4s import USPS_4State
-from reportlab.lib import colors
-from reportlab.lib.units import inch
-from reportlab.pdfbase.pdfmetrics import stringWidth
-from reportlab.pdfgen import canvas as _canvas
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+from weasyprint import HTML
 
-# ---------------------------------------------------------------------------
-# Page + element geometry (USPS-B-3200 / DMM 202)
-# ---------------------------------------------------------------------------
+from mailwatch.imb import encode as _imb_encode
 
-# #10 business envelope: 9.5" x 4.125".
-_ENV_W: float = 9.5 * inch
-_ENV_H: float = 4.125 * inch
-
-# Return address block (sender): Helvetica 9pt, 11pt leading.
-_RETURN_X: float = 0.5 * inch
-_RETURN_TOP_Y: float = _ENV_H - 0.5 * inch
-_RETURN_FONT = "Helvetica"
-_RETURN_FONT_SIZE: float = 9.0
-_RETURN_LEADING: float = 11.0
-
-# Delivery address block (recipient): Helvetica 11pt, 13pt leading.
-# Must sit inside OCR Read Area: X in [0.5", 9.0"], Y in [0.625", 3.375"].
-_DELIVERY_X: float = 3.5 * inch
-_DELIVERY_TOP_Y: float = 2.5 * inch
-_DELIVERY_FONT = "Helvetica"
-_DELIVERY_FONT_SIZE: float = 11.0
-_DELIVERY_LEADING: float = 13.0
-
-# IMb barcode anchor (bottom-left corner of the barcode on the envelope).
-# USPS_4State's defaults are spec-compliant: barWidth=0.02", barHeight=0.165",
-# horizontalClearZone=0.125", verticalClearZone=0.028".
-_IMB_X: float = 5.75 * inch
-_IMB_Y: float = 0.3125 * inch
-
-# Human-readable text directly above the bars (when human_readable=True).
-# Positioned at: barcode baseline + vertical clear zone + bar height + 3pt gap.
-# USPS_4State default barHeight is 0.165" = 11.88pt; vcz is 0.028" = 2.016pt.
-# -> 0.3125" + 0.028" + 0.165" + a tiny gap. The plan gives ~0.4875" empirically.
-_HR_Y: float = 0.4875 * inch
-_HR_FONT = "Helvetica"
-_HR_FONT_SIZE: float = 6.0
-
-# Avery 8163 (4" x 2" labels, 2 cols x 5 rows on US Letter).
-# All pylabels dimensions are in millimetres.
-_AVERY_COLS = 2
-_AVERY_ROWS = 5
-_AVERY_SPEC = pylabels.Specification(
-    sheet_width=215.9,
-    sheet_height=279.4,  # 8.5" x 11" (mm)
-    columns=_AVERY_COLS,
-    rows=_AVERY_ROWS,
-    label_width=101.6,
-    label_height=50.8,  # 4" x 2" (mm)
-    # Vertical: 5 * 50.8 = 254mm used; 279.4 - 254 = 25.4mm split 12.7 top / 12.7 bottom.
-    top_margin=12.7,
-    bottom_margin=12.7,  # 0.5" each
-    # Horizontal: 2 * 101.6 = 203.2mm used; 215.9 - 203.2 = 12.7mm split 4.7625/4.7625/3.175.
-    left_margin=4.7625,
-    right_margin=4.7625,  # 0.1875" each
-    column_gap=3.175,  # 0.125"
-    row_gap=0,
-    corner_radius=1.5,
-)
-
-# Inside a label drawing_callable, pylabels hands us dimensions in points.
-# 2mm padding = ~5.67 pt; 10pt Helvetica recipient text.
-_LABEL_PAD: float = 2.0 * 2.83465  # 2mm in pt
-_LABEL_RECIP_FONT = "Helvetica"
-_LABEL_RECIP_FONT_SIZE: float = 10.0
-_LABEL_RECIP_LEADING: float = 12.0
-_LABEL_HR_FONT = "Helvetica"
-_LABEL_HR_FONT_SIZE: float = 6.0
+_TEMPLATE_PACKAGE = "mailwatch.templates.pdf"
 
 
-# ---------------------------------------------------------------------------
-# Public data shape
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Public data shape                                                           #
+# --------------------------------------------------------------------------- #
 
 
 class LabelData(TypedDict):
     """Per-label payload for :func:`render_avery8163`.
 
-    ``recipient`` is a list of pre-formatted address lines (UPPERCASE for
-    scanner readability is applied internally). ``tracking`` is the 20-digit
-    IMb tracking string (Barcode ID + STID + Mailer ID + Serial). ``routing``
-    is a 0, 5, 9, or 11-digit delivery-point ZIP; empty string is valid.
+    ``recipient`` is a list of pre-formatted address lines (rendered
+    verbatim — UPPERCASE-conversion is caller responsibility if wanted
+    for scanner friendliness).  ``tracking`` is the 20-digit IMb
+    tracking string. ``routing`` is a 0/5/9/11-digit delivery-point ZIP
+    code; empty string is valid.
     """
 
     recipient: list[str]
@@ -130,9 +50,81 @@ class LabelData(TypedDict):
     routing: str
 
 
-# ---------------------------------------------------------------------------
-# Envelope rendering
-# ---------------------------------------------------------------------------
+AveryMode = Literal["single", "fill", "batch"]
+
+_AVERY_COLS = 2
+_AVERY_ROWS = 5
+
+
+# --------------------------------------------------------------------------- #
+# Jinja environment (cached)                                                  #
+# --------------------------------------------------------------------------- #
+
+
+def _templates_dir() -> Path:
+    with resources.as_file(resources.files(_TEMPLATE_PACKAGE)) as path:
+        return Path(path)
+
+
+_jinja = Environment(
+    loader=FileSystemLoader(_templates_dir()),
+    autoescape=select_autoescape(["html"]),
+    trim_blocks=False,
+    lstrip_blocks=False,
+)
+
+
+# --------------------------------------------------------------------------- #
+# Tracking + routing helpers                                                  #
+# --------------------------------------------------------------------------- #
+
+
+def _tracking_to_components(tracking: str) -> tuple[int, int, int, int]:
+    """Decompose a 20-digit IMb tracking string into its spec fields.
+
+    Per USPS-B-3200 the 20-digit tracking code layout is::
+
+        BB TTT MMMMMMMMM SSSSSS    (9-digit MID)
+        BB TTT MMMMMM    SSSSSSSSS (6-digit MID)
+
+    MID length is determined by the first digit: 6-digit MIDs begin
+    with ``9``, 9-digit MIDs begin with ``0``–``8`` (per USPS Mailer ID
+    allocation rules). We honour that convention; if USPS ever relaxes
+    it we'll revisit.
+    """
+    if len(tracking) != 20 or not tracking.isdigit():
+        raise ValueError(f"tracking must be 20 digits, got {tracking!r}")
+    barcode_id = int(tracking[0:2])
+    service_type = int(tracking[2:5])
+    if tracking[5] == "9":
+        mailer_id = int(tracking[5:11])
+        serial = int(tracking[11:20])
+    else:
+        mailer_id = int(tracking[5:14])
+        serial = int(tracking[14:20])
+    return barcode_id, service_type, mailer_id, serial
+
+
+def _encode_bars(tracking: str, routing: str) -> str:
+    """Return the 65-char F/A/D/T string ready for the USPSIMBStandard font."""
+    barcode_id, service_type, mailer_id, serial = _tracking_to_components(tracking)
+    return _imb_encode(barcode_id, service_type, mailer_id, serial, routing)
+
+
+def _human_readable(tracking: str, routing: str) -> str:
+    """Format the human-readable digit line that sits below the bars.
+
+    USPS convention (and upstream) is grouped as
+    ``BB TTT MMMMMMMMM SSSSSS [ZIP]`` for visual scanability. We
+    present the raw tracking + routing with a single space separator —
+    visually close enough and avoids hyphen ambiguity.
+    """
+    return f"{tracking} {routing}".rstrip()
+
+
+# --------------------------------------------------------------------------- #
+# Envelope rendering                                                          #
+# --------------------------------------------------------------------------- #
 
 
 def render_envelope(
@@ -142,219 +134,130 @@ def render_envelope(
     routing: str,
     out: BinaryIO,
     *,
-    human_readable: bool = True,
+    human_readable: bool = True,  # noqa: ARG001 — retained for API compat; always True
 ) -> None:
-    """Render one #10 envelope (9.5" x 4.125") to ``out``.
+    """Render a single #10 envelope PDF (9.5" × 4.125") to ``out``.
 
-    Args:
-        sender: Return-address block as a list of pre-formatted lines
-            (rendered uppercase, 9pt Helvetica, top-left origin).
-        recipient: Delivery-address block as a list of pre-formatted lines
-            (rendered uppercase, 11pt Helvetica, positioned inside the USPS
-            OCR Read Area).
-        tracking: 20-digit IMb tracking string (Barcode ID + STID +
-            Mailer ID + Serial).
-        routing: 0, 5, 9, or 11 digit destination ZIP/ZIP+4/DPC. Empty
-            string is valid (the barcode is still drawn, without routing
-            digits).
-        out: Binary sink for the rendered PDF bytes.
-        human_readable: If True (default), draw the tracking + routing
-            string in 6pt Helvetica directly above the barcode bars. USPS
-            does not require the human-readable line; set False to omit it.
+    Layout (matching upstream 1997cui/envelope):
+
+    * Sender block: top-left, DejaVu Serif 10pt-ish, plain text lines.
+    * Recipient block: bottom-right, flex column — barcode bars on
+      top, human-readable digits below, recipient address lines below
+      that. Automatic vertical centering inside a 4"×2.5" box anchored
+      at ``left: 5in; bottom: 0.625in``.
+
+    ``human_readable`` is accepted for API compatibility but ignored —
+    the human-readable line is always rendered (consistent with
+    upstream + USPS recommendations).
     """
-    c = _canvas.Canvas(out, pagesize=(_ENV_W, _ENV_H))
-
-    _draw_address_block(
-        c,
-        sender,
-        x=_RETURN_X,
-        top_y=_RETURN_TOP_Y,
-        font=_RETURN_FONT,
-        size=_RETURN_FONT_SIZE,
-        leading=_RETURN_LEADING,
+    html_str = _jinja.get_template("envelope.html").render(
+        sender_lines=sender,
+        recipient_lines=recipient,
+        barcode_bars=_encode_bars(tracking, routing),
+        human_readable=_human_readable(tracking, routing),
     )
-    _draw_address_block(
-        c,
-        recipient,
-        x=_DELIVERY_X,
-        top_y=_DELIVERY_TOP_Y,
-        font=_DELIVERY_FONT,
-        size=_DELIVERY_FONT_SIZE,
-        leading=_DELIVERY_LEADING,
-    )
-
-    # Pure K (0,0,0) for scanner contrast per USPS-B-3200.
-    c.setFillColorRGB(0, 0, 0)
-    barcode = USPS_4State(value=tracking, routing=routing)
-    barcode.drawOn(c, _IMB_X, _IMB_Y)
-
-    if human_readable:
-        c.setFont(_HR_FONT, _HR_FONT_SIZE)
-        text = f"{tracking} {routing}".rstrip()
-        c.drawString(_IMB_X, _HR_Y, text)
-
-    c.showPage()
-    c.save()
+    HTML(string=html_str, base_url=str(_templates_dir())).write_pdf(out)
 
 
-def _draw_address_block(
-    c: _canvas.Canvas,
-    lines: list[str],
-    *,
-    x: float,
-    top_y: float,
-    font: str,
-    size: float,
-    leading: float,
-) -> None:
-    """Draw an UPPERCASE address block descending from ``top_y`` at ``x``."""
-    c.setFont(font, size)
-    c.setFillColorRGB(0, 0, 0)
-    y = top_y
-    for line in lines:
-        c.drawString(x, y, line.upper())
-        y -= leading
+# --------------------------------------------------------------------------- #
+# Avery 8163 rendering                                                        #
+# --------------------------------------------------------------------------- #
 
 
-# ---------------------------------------------------------------------------
-# Avery 8163 label-sheet rendering
-# ---------------------------------------------------------------------------
+def _label_dict(label: LabelData, row: int, col: int) -> dict[str, object]:
+    """Build a template-renderable dict for one label at (row, col)."""
+    return {
+        "row": row,
+        "col": col,
+        "barcode_bars": _encode_bars(label["tracking"], label["routing"]),
+        "human_readable": _human_readable(label["tracking"], label["routing"]),
+        "recipient_lines": label["recipient"],
+    }
 
 
-class _ShapeRecorderCanvas:
-    """Minimal canvas shim that records ``rect`` calls into a shapes Group.
+def _assign_positions(
+    items: list[LabelData],
+    start_row: int,
+    start_col: int,
+) -> list[list[dict[str, object]]]:
+    """Distribute ``items`` across sheet positions starting at (start_row, start_col).
 
-    :class:`USPS_4State` (a :class:`~reportlab.platypus.flowables.Flowable`)
-    calls ``self.canv.rect(x, y, w, h, stroke=..., fill=...)`` for each of
-    the 65 bars. pylabels hands our drawing_callable a
-    :class:`~reportlab.graphics.shapes.Drawing` — not a canvas — so we
-    provide this shim as ``barcode.canv`` to capture the bars as
-    :class:`~reportlab.graphics.shapes.Rect` objects instead.
+    Returns a list of pages; each page is a list of label-dicts with
+    their (row, col) fixed. Row-major order within each page; overflow
+    spills to additional pages starting at (1, 1).
     """
-
-    def __init__(self) -> None:
-        self.group: shapes.Group = shapes.Group()
-        self._fill: Any = colors.black
-        self._stroke: Any = colors.black
-
-    def rect(
-        self,
-        x: float,
-        y: float,
-        w: float,
-        h: float,
-        stroke: int = 0,
-        fill: int = 1,
-    ) -> None:
-        r = shapes.Rect(x, y, w, h)
-        r.fillColor = self._fill if fill else None
-        r.strokeColor = self._stroke if stroke else None
-        r.strokeWidth = 0
-        self.group.add(r)
-
-    def setFillColor(self, c: Any) -> None:  # noqa: N802 (reportlab convention)
-        self._fill = c
-
-    def setStrokeColor(self, c: Any) -> None:  # noqa: N802
-        self._stroke = c
-
-    def setFillColorRGB(self, r: float, g: float, b: float) -> None:  # noqa: N802
-        self._fill = colors.Color(r, g, b)
-
-
-def _barcode_group(tracking: str, routing: str) -> tuple[shapes.Group, float, float]:
-    """Render a USPS_4State barcode into a shapes Group.
-
-    Returns the (group, width, height) in points. The group's local origin
-    is (0, 0) at the bottom-left of the barcode's bounding box.
-    """
-    recorder = _ShapeRecorderCanvas()
-    barcode = USPS_4State(value=tracking, routing=routing)
-    barcode.canv = recorder
-    # USPS_4State.drawHumanReadable() also calls self.canv — we draw our own
-    # human-readable line below, so stub it out here.
-    barcode.drawHumanReadable = lambda: None
-    barcode.draw()
-    return recorder.group, float(barcode.width), float(barcode.height)
-
-
-def _draw_label(
-    label: shapes.Drawing,
-    width: float,
-    height: float,
-    obj: LabelData,
-) -> None:
-    """pylabels drawing_callable — draws one label's contents.
-
-    The ``label`` drawing's origin is (0, 0) at the label's bottom-left;
-    ``width`` and ``height`` are the label's drawable area in points.
-    """
-    # Recipient address block (top-left, descending).
-    text_x = _LABEL_PAD
-    text_top = height - _LABEL_PAD
-    y = text_top - _LABEL_RECIP_FONT_SIZE
-    for line in obj["recipient"]:
-        s = shapes.String(text_x, y, line.upper())
-        s.fontName = _LABEL_RECIP_FONT
-        s.fontSize = _LABEL_RECIP_FONT_SIZE
-        s.fillColor = colors.black
-        label.add(s)
-        y -= _LABEL_RECIP_LEADING
-
-    # Barcode (bottom-right).
-    group, bc_w, bc_h = _barcode_group(obj["tracking"], obj["routing"])
-    bc_x = width - _LABEL_PAD - bc_w
-    bc_y = _LABEL_PAD + _LABEL_HR_FONT_SIZE + 2.0  # leave room for HR text below
-    group.translate(bc_x, bc_y)
-    label.add(group)
-
-    # Human-readable tracking text below barcode.
-    hr_text = f"{obj['tracking']} {obj['routing']}".rstrip()
-    hr_width = stringWidth(hr_text, _LABEL_HR_FONT, _LABEL_HR_FONT_SIZE)
-    hr = shapes.String(bc_x + bc_w - hr_width, _LABEL_PAD, hr_text)
-    hr.fontName = _LABEL_HR_FONT
-    hr.fontSize = _LABEL_HR_FONT_SIZE
-    hr.fillColor = colors.black
-    label.add(hr)
+    pages: list[list[dict[str, object]]] = []
+    current: list[dict[str, object]] = []
+    row, col = start_row, start_col
+    for item in items:
+        current.append(_label_dict(item, row, col))
+        col += 1
+        if col > _AVERY_COLS:
+            col = 1
+            row += 1
+        if row > _AVERY_ROWS:
+            pages.append(current)
+            current = []
+            row, col = 1, 1
+    if current:
+        pages.append(current)
+    return pages
 
 
 def render_avery8163(
-    labels_data: list[LabelData],
+    labels_data: list[LabelData] | LabelData,
     out: BinaryIO,
     *,
+    mode: AveryMode = "fill",
     start_row: int = 1,
     start_col: int = 1,
 ) -> None:
-    """Render an Avery 8163 sheet (2 x 5 grid of 4" x 2" labels) to ``out``.
+    """Render an Avery 8163 sheet of 4"×2" labels to ``out``.
 
     Args:
-        labels_data: Per-label payloads. Renders one label per entry, in
-            row-major order starting at (``start_row``, ``start_col``).
+        labels_data: A single :class:`LabelData` (``mode="single"`` or
+            ``"fill"``) or a list (``mode="batch"``).
         out: Binary sink for the rendered PDF bytes.
-        start_row: 1-indexed row on page 1 to start at (skips earlier rows).
-        start_col: 1-indexed column within ``start_row`` to start at.
+        mode: How to distribute ``labels_data`` across sheet positions.
 
-    The first ``(start_row - 1) * 2 + (start_col - 1)`` label positions on
-    page 1 are marked as used (so we can resume printing on a partially
-    consumed sheet).
+            * ``"single"`` — exactly one label at
+              (``start_row``, ``start_col``). Matches upstream's
+              one-label-per-PDF behaviour for partial-sheet reuse.
+            * ``"fill"`` (default) — repeat the single label across
+              every remaining slot starting at
+              (``start_row``, ``start_col``).
+            * ``"batch"`` — ``labels_data`` is a list of distinct
+              labels, placed row-major starting at
+              (``start_row``, ``start_col``), spilling to additional
+              pages if there are more than ``10 - skip`` entries.
+        start_row: 1-indexed row on page 1 (1..5).
+        start_col: 1-indexed column within that row (1..2).
     """
     if not 1 <= start_row <= _AVERY_ROWS:
-        raise ValueError(f"start_row must be in 1..{_AVERY_ROWS} (got {start_row})")
+        raise ValueError(f"start_row must be 1..{_AVERY_ROWS}, got {start_row}")
     if not 1 <= start_col <= _AVERY_COLS:
-        raise ValueError(f"start_col must be in 1..{_AVERY_COLS} (got {start_col})")
+        raise ValueError(f"start_col must be 1..{_AVERY_COLS}, got {start_col}")
 
-    sheet = pylabels.Sheet(_AVERY_SPEC, _draw_label, border=False)
+    if mode == "batch":
+        if not isinstance(labels_data, list):
+            raise ValueError("mode='batch' requires a list of LabelData")
+        items: list[LabelData] = labels_data
+    else:
+        if isinstance(labels_data, list):
+            if len(labels_data) != 1:
+                raise ValueError(
+                    f"mode={mode!r} requires a single LabelData (got {len(labels_data)})"
+                )
+            single: LabelData = labels_data[0]
+        else:
+            single = labels_data
+        if mode == "single":
+            items = [single]
+        else:  # "fill"
+            total_slots = _AVERY_COLS * _AVERY_ROWS
+            skip = (start_row - 1) * _AVERY_COLS + (start_col - 1)
+            items = [single] * max(0, total_slots - skip)
 
-    skip_count = (start_row - 1) * _AVERY_COLS + (start_col - 1)
-    if skip_count > 0:
-        used: list[tuple[int, int]] = []
-        for i in range(skip_count):
-            r = i // _AVERY_COLS + 1
-            col = i % _AVERY_COLS + 1
-            used.append((r, col))
-        sheet.partial_page(1, used)
-
-    for item in labels_data:
-        sheet.add_label(item)
-
-    sheet.save(out)
+    pages = _assign_positions(items, start_row, start_col)
+    html_str = _jinja.get_template("avery8163.html").render(pages=pages)
+    HTML(string=html_str, base_url=str(_templates_dir())).write_pdf(out)
