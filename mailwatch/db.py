@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -74,6 +75,19 @@ def connect(path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # Ensure the DB + WAL + SHM files are group-writable so sidecar
+    # processes (e.g. Litestream running as a different uid but in our
+    # primary group) can write their bookkeeping tables. SQLite opens
+    # with mode 0644 which combined with a typical 0007 umask lands at
+    # 0640 — read-only for the group. chmod silently tolerates not being
+    # the owner (another process may have already created the files).
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(str(path) + suffix)
+        if candidate.exists():
+            try:
+                os.chmod(candidate, 0o660)
+            except PermissionError:
+                pass
     return conn
 
 
