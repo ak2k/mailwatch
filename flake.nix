@@ -104,11 +104,15 @@
         {
           # Python tooling caches must point at the sandbox-writable $TMPDIR;
           # the source tree `cd`-d into is a read-only /nix/store path.
+          # LD_LIBRARY_PATH carries WeasyPrint's dlopen targets so
+          # `import mailwatch.pdf` works under test — same plumbing
+          # the nixosModule does for runtime services.
           tests = pkgs.runCommand "mailwatch-tests" { nativeBuildInputs = [ devEnv ]; } ''
             cp -r ${./.}/. .
             chmod -R u+w .
             export HOME=$TMPDIR
             export PYTEST_CACHE_DIR=$TMPDIR/.pytest_cache
+            export LD_LIBRARY_PATH=${nixpkgs.lib.makeLibraryPath (weasyprintNativeLibs system)}
             pytest
             touch $out
           '';

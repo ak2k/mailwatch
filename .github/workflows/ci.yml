@@ -46,6 +46,15 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
+      # WeasyPrint dlopens pango/cairo/glib/harfbuzz/fontconfig at
+      # import time. Ubuntu GHA runners don't preinstall these; add
+      # them so pytest can import mailwatch.pdf.
+      - name: Install WeasyPrint native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpango-1.0-0 libpangoft2-1.0-0 \
+            libcairo2 libharfbuzz0b libfontconfig1
       - run: uv sync --locked --group dev
       - run: uv run pytest --cov=mailwatch --cov-report=xml --junitxml=pytest.xml
       - if: always()
