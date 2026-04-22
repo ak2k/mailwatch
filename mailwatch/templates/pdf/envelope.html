@@ -5,6 +5,13 @@
 	<title>Envelope</title>
 </head>
 <style>
+/* WeasyPrint uses @page for page dimensions — upstream's wkhtmltopdf
+   was given --page-width / --page-height on the command line instead. */
+@page {
+    size: 9.5in 4.125in;
+    margin: 0;
+}
+
 * {
     box-sizing: border-box;
 }
