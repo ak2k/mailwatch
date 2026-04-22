@@ -153,11 +153,6 @@ class GenerateForm(BaseModel):
     # populates it on a successful standardize and clears it on any
     # subsequent address edit.
     delivery_point: str | None = Field(default=None, pattern=r"^\d{2}$")
-    # How many distinct IMb serials to mint and label/envelope pages to
-    # render. 1 is the common single-letter flow; larger values batch-
-    # mail the same recipient with per-letter tracking (each physical
-    # piece gets its own serial so IV-MTR can tell scans apart).
-    label_count: int = Field(default=1, ge=1, le=_MAX_LABEL_COUNT)
 
 
 class TrackWSRequest(BaseModel):
@@ -386,7 +381,6 @@ async def post_generate(
     recipient_company: Annotated[str | None, Form()] = None,
     recipient_address2: Annotated[str | None, Form()] = None,
     delivery_point: Annotated[str | None, Form()] = None,
-    label_count: Annotated[int, Form()] = 1,
     settings: Settings = Depends(get_settings_dep),
     locked: tuple[sqlite3.Connection, asyncio.Lock] = Depends(get_db_locked),
     new_api: NewApiClient = Depends(get_new_api),
@@ -420,7 +414,6 @@ async def post_generate(
             recipient_zip=recipient_zip,
             # Empty-string from form → None so Pydantic's pattern skips.
             delivery_point=delivery_point or None,
-            label_count=label_count,
         )
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
@@ -429,25 +422,27 @@ async def post_generate(
 
     conn, lock = locked
     bucket = _day_bucket()
-    serials: list[int] = await _db_call(lock, db.next_serials, conn, bucket, form.label_count)
-
-    trackings: list[str] = [_build_tracking(settings, s) for s in serials]
+    # Mint a single serial — the common-case output. Batch size is an
+    # output option on /preview; extra serials are minted on demand by
+    # :func:`_ensure_batch_size` when the user picks count > 1. Minting
+    # the first one here (rather than waiting for /preview) keeps
+    # /preview's "session required" guard meaningful: hitting /preview
+    # without a prior /generate still yields the empty-session 400.
+    serials: list[int] = await _db_call(lock, db.next_serials, conn, bucket, 1)
+    trackings: list[str] = [_build_tracking(settings, serials[0])]
     routing = _build_routing(str(recipient["zip"]), effective_dp)
-    # Validate every encoding end-to-end — any out-of-range serial fails
-    # here rather than at /download/pdf time.
-    for serial, tracking in zip(serials, trackings, strict=True):
-        imb.encode(
-            settings.BARCODE_ID,
-            settings.SRV_TYPE,
-            settings.MAILER_ID,
-            serial,
-            routing,
-        )
-        del tracking  # tracking is derived for validation only; stored below
+    # Validate encoding end-to-end — raises ValueError on any out-of-range field.
+    imb.encode(
+        settings.BARCODE_ID,
+        settings.SRV_TYPE,
+        settings.MAILER_ID,
+        serials[0],
+        routing,
+    )
 
-    # Session holds the piece-of-mail identity (sender/recipient + lists
-    # of serials/trackings for batch mailings). Output-format preferences
-    # ride on the URL, not the session.
+    # Session holds the piece-of-mail identity (sender/recipient + the
+    # growing lists of serials/trackings). Output-format preferences
+    # including batch count ride on the URL, not the session.
     request.session["sender_address"] = form.sender_address
     request.session["recipient"] = recipient
     request.session["serials"] = serials
@@ -455,12 +450,59 @@ async def post_generate(
     request.session["routing"] = routing
 
     # 303 = "see other" — turns the POST into a GET for the redirect target,
-    # so refreshing the preview page doesn't resubmit the form. The preview
-    # page lets the user pick envelope vs Avery via its own format radio,
-    # so /generate doesn't need to carry a format choice through.
+    # so refreshing the preview page doesn't resubmit the form.
     return RedirectResponse(
         url="/preview",
         status_code=303,
+    )
+
+
+async def _ensure_batch_size(
+    request: Request,
+    piece: MailPiece,
+    count: int,
+    settings: Settings,
+    locked: tuple[sqlite3.Connection, asyncio.Lock],
+) -> MailPiece:
+    """Grow the session's serial list to at least ``count`` entries.
+
+    Called from /preview + /download/pdf when the ``count`` output-option
+    query param exceeds what's already in the session. Mints only the
+    deficit (monotonic), so reducing ``count`` later doesn't waste
+    serials — the first N trackings are re-used.
+
+    Design note: this is the one GET handler that mutates session state,
+    which is unconventional REST. The alternative (POST /mint_extra + JS)
+    adds plumbing for no user benefit — growing the batch is a
+    deterministic consequence of picking a bigger number in the output
+    form, and the session is meant to accumulate everything about the
+    current mail piece anyway.
+    """
+    if count <= piece.count:
+        return piece
+    extra = count - piece.count
+    conn, lock = locked
+    bucket = _day_bucket()
+    new_serials: list[int] = await _db_call(lock, db.next_serials, conn, bucket, extra)
+    new_trackings = [_build_tracking(settings, s) for s in new_serials]
+    for serial in new_serials:
+        imb.encode(
+            settings.BARCODE_ID,
+            settings.SRV_TYPE,
+            settings.MAILER_ID,
+            serial,
+            piece.routing,
+        )
+    combined_serials = list(piece.serials) + new_serials
+    combined_trackings = list(piece.trackings) + new_trackings
+    request.session["serials"] = combined_serials
+    request.session["trackings"] = combined_trackings
+    return MailPiece(
+        sender_address=piece.sender_address,
+        recipient=piece.recipient,
+        serials=tuple(combined_serials),
+        trackings=tuple(combined_trackings),
+        routing=piece.routing,
     )
 
 
@@ -538,6 +580,7 @@ class PreviewOptions:
     row: int
     col: int
     hr: bool
+    count: int
 
     def query_string(self) -> str:
         """Render the options back into a canonical query string for the PDF URL."""
@@ -549,6 +592,7 @@ class PreviewOptions:
                 "row": self.row,
                 "col": self.col,
                 "hr": "1" if self.hr else "0",
+                "count": self.count,
             }
         )
 
@@ -575,12 +619,13 @@ def _preview_options(
     part: str = DEFAULT_AVERY,
     row: int = 1,
     col: int = 1,
+    count: int = 1,
 ) -> PreviewOptions:
     """FastAPI dep: parse, validate, clamp the output-options query string.
 
-    The old ``mode`` field (single vs fill-same-serial) is gone — label
-    count is now set at /generate time via ``label_count``, so the
-    preview page just places ``piece.count`` labels starting at (row, col).
+    ``count`` is the batch size: how many distinct tracking numbers to
+    render. Values are clamped into [1, _MAX_LABEL_COUNT]; /preview will
+    mint extra serials on demand via :func:`_ensure_batch_size`.
     """
     if size not in ENVELOPES:
         raise HTTPException(status_code=400, detail=f"unknown envelope size: {size}")
@@ -589,6 +634,7 @@ def _preview_options(
     tpl = AVERY[part]
     clamped_row = max(1, min(row, tpl.rows))
     clamped_col = max(1, min(col, tpl.cols))
+    clamped_count = max(1, min(count, _MAX_LABEL_COUNT))
     hr_on = _parse_bool_last(request.query_params.getlist("hr"))
     return PreviewOptions(
         fmt=fmt,
@@ -597,6 +643,7 @@ def _preview_options(
         row=clamped_row,
         col=clamped_col,
         hr=hr_on,
+        count=clamped_count,
     )
 
 
@@ -605,32 +652,38 @@ async def get_preview(
     request: Request,
     piece: MailPiece = Depends(_require_session_piece),
     opts: PreviewOptions = Depends(_preview_options),
+    settings: Settings = Depends(get_settings_dep),
+    locked: tuple[sqlite3.Connection, asyncio.Lock] = Depends(get_db_locked),
 ) -> Response:
     """Render the preview page with the current output options.
 
     All option state lives in the URL — changing a radio / select in the
     preview form navigates back to this route with different query params
-    and the PDF embed reloads. No POST, no session mutation, no new
-    serial.
+    and the PDF embed reloads. No POST, no session mutation of sender
+    or recipient. Batch size (``count``) may mint extra serials on demand
+    when grown, but the serial allocation is monotonic: the first N
+    trackings are always stable for any count >= N.
     """
+    piece = await _ensure_batch_size(request, piece, opts.count, settings, locked)
     tpl = AVERY[opts.part]
     pdf_url = f"/download/pdf?{opts.query_string()}"
     tracking_url = f"/tracking?serial={piece.serial}&zip={piece.recipient_zip}"
     # Per-tracking URLs so a batch user can open any one letter's page
-    # from the confirmation panel. List order matches piece.trackings.
+    # from the confirmation panel. Truncated to opts.count — we only
+    # show what's being rendered on this preview, not whatever extras
+    # a previous larger-count visit may have left in the session.
+    rendered_serials = piece.serials[: opts.count]
     tracking_urls = [
-        {
-            "serial": s,
-            "url": f"/tracking?serial={s}&zip={piece.recipient_zip}",
-        }
-        for s in piece.serials
+        {"serial": s, "url": f"/tracking?serial={s}&zip={piece.recipient_zip}"}
+        for s in rendered_serials
     ]
     return templates.TemplateResponse(
         request,
         "preview.html",
         {
             "serial": piece.serial,
-            "count": piece.count,
+            "count": opts.count,
+            "max_count": _MAX_LABEL_COUNT,
             "tracking_urls": tracking_urls,
             "recipient_zip": piece.recipient_zip,
             "fmt": opts.fmt,
@@ -651,16 +704,22 @@ async def get_preview(
 
 @router.get("/download/pdf")
 async def get_download_pdf(
+    request: Request,
     piece: MailPiece = Depends(_require_session_piece),
     opts: PreviewOptions = Depends(_preview_options),
+    settings: Settings = Depends(get_settings_dep),
+    locked: tuple[sqlite3.Connection, asyncio.Lock] = Depends(get_db_locked),
 ) -> Response:
     """Render the session's mail piece(s) as a PDF using the given options.
 
-    For batch flows (``piece.count > 1``) the rendered PDF contains N
-    envelopes (one per page) or N labels (paginated across Avery sheets
-    starting at the chosen (row, col) slot), each carrying its own
-    tracking from ``piece.trackings``.
+    For batch flows (``count > 1``) the rendered PDF contains N envelopes
+    (one per page) or N labels (paginated across Avery sheets starting at
+    the chosen (row, col) slot), each carrying its own tracking. If the
+    session doesn't yet have enough serials for ``count``, more are minted
+    on the fly — same monotonic semantics as /preview.
     """
+    piece = await _ensure_batch_size(request, piece, opts.count, settings, locked)
+    rendered_trackings = piece.trackings[: opts.count]
     buf = io.BytesIO()
     if opts.fmt == "envelope":
         envelopes: list[pdf.EnvelopeData] = [
@@ -670,7 +729,7 @@ async def get_download_pdf(
                 "tracking": t,
                 "routing": piece.routing,
             }
-            for t in piece.trackings
+            for t in rendered_trackings
         ]
         await asyncio.to_thread(
             pdf.render_envelope,
@@ -681,8 +740,8 @@ async def get_download_pdf(
         )
         filename = (
             f"envelope-{piece.serial}.pdf"
-            if piece.count == 1
-            else f"envelope-{piece.serial}-x{piece.count}.pdf"
+            if opts.count == 1
+            else f"envelope-{piece.serial}-x{opts.count}.pdf"
         )
     else:
         labels: list[pdf.LabelData] = [
@@ -691,7 +750,7 @@ async def get_download_pdf(
                 "tracking": t,
                 "routing": piece.routing,
             }
-            for t in piece.trackings
+            for t in rendered_trackings
         ]
         await asyncio.to_thread(
             pdf.render_avery,
@@ -704,8 +763,8 @@ async def get_download_pdf(
         )
         filename = (
             f"avery-{opts.part}-{piece.serial}.pdf"
-            if piece.count == 1
-            else f"avery-{opts.part}-{piece.serial}-x{piece.count}.pdf"
+            if opts.count == 1
+            else f"avery-{opts.part}-{piece.serial}-x{opts.count}.pdf"
         )
 
     return Response(

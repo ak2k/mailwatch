@@ -262,18 +262,11 @@ def test_generate_fallback_drops_stale_dp_with_zip5(client: TestClient) -> None:
     assert _routing_from_generate(client, recipient_zip="20500", delivery_point="23") == "20500"
 
 
-def test_generate_batch_mints_n_distinct_serials(client: TestClient) -> None:
-    """label_count=5 should allocate five distinct serials in one /generate."""
-    resp = client.post(
-        "/generate",
-        data=_valid_form(label_count="5"),
-        follow_redirects=False,
-    )
-    assert resp.status_code == 303, resp.text
-    # /preview callout lists each tracking number when count > 1.
-    preview = client.get("/preview")
+def test_preview_batch_count_mints_extra_serials(client: TestClient) -> None:
+    """Picking count=5 on /preview should mint 4 extra serials on demand."""
+    _submit_generate(client)  # 1 serial initially
+    preview = client.get("/preview", params={"count": 5})
     assert preview.status_code == 200
-    # The five serials should appear as distinct <code> entries.
     body = preview.text
     assert "Batch of 5 letters" in body
     # 5 list items in the batch tracking-list (one per serial), distinct
@@ -282,32 +275,50 @@ def test_generate_batch_mints_n_distinct_serials(client: TestClient) -> None:
     assert body.count("<li><code>") == 5
 
 
-def test_generate_batch_rejects_over_max(client: TestClient) -> None:
-    """label_count > _MAX_LABEL_COUNT (30) must 422."""
-    resp = client.post(
-        "/generate",
-        data=_valid_form(label_count="99"),
-        follow_redirects=False,
-    )
-    assert resp.status_code == 422
+def test_preview_batch_count_is_monotonic(client: TestClient) -> None:
+    """Growing to 5 then shrinking to 3 must re-use the first 3 serials."""
+    _submit_generate(client)
+    five = client.get("/preview", params={"count": 5})
+    assert five.status_code == 200
+    three = client.get("/preview", params={"count": 3})
+    assert three.status_code == 200
+    body = three.text
+    # First 3 <li><code>NNNN</code> serials should match the first 3 of
+    # the count=5 render. Extract all <code>N</code> inside <li>.
+    import re
+
+    five_serials = re.findall(r"<li><code>(\d+)</code>", five.text)
+    three_serials = re.findall(r"<li><code>(\d+)</code>", body)
+    assert len(five_serials) == 5
+    assert len(three_serials) == 3
+    assert (
+        three_serials == five_serials[:3]
+    ), f"serials changed on shrink: {three_serials} vs first 3 of {five_serials}"
 
 
-def test_generate_batch_rejects_zero(client: TestClient) -> None:
-    """label_count=0 has no meaningful interpretation; 422."""
-    resp = client.post(
-        "/generate",
-        data=_valid_form(label_count="0"),
-        follow_redirects=False,
-    )
-    assert resp.status_code == 422
+def test_preview_batch_count_clamps_over_max(client: TestClient) -> None:
+    """count=99 is clamped to _MAX_LABEL_COUNT (30); no 422."""
+    _submit_generate(client)
+    resp = client.get("/preview", params={"count": 99})
+    assert resp.status_code == 200
+    assert "Batch of 30 letters" in resp.text
+
+
+def test_preview_batch_count_clamps_zero(client: TestClient) -> None:
+    """count=0 clamps to 1; preview renders single-letter callout."""
+    _submit_generate(client)
+    resp = client.get("/preview", params={"count": 0})
+    assert resp.status_code == 200
+    # count=1 → "Save these to track your letter:" not "Batch of N letters:"
+    assert "Batch of" not in resp.text
 
 
 def test_download_pdf_envelope_batch_is_multipage(client: TestClient) -> None:
     """5-letter envelope batch → 5-page PDF."""
     import pypdf
 
-    _submit_generate(client, label_count="5")
-    resp = client.get("/download/pdf", params={"fmt": "envelope"})
+    _submit_generate(client)
+    resp = client.get("/download/pdf", params={"fmt": "envelope", "count": 5})
     assert resp.status_code == 200
     assert resp.content.startswith(b"%PDF-")
     reader = pypdf.PdfReader(io.BytesIO(resp.content))
