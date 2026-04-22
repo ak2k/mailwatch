@@ -73,11 +73,15 @@ class TestIVMTRTokenResponse:
         )
         assert token.refresh_token == "rt-xyz"
 
-    def test_missing_refresh_token_fails(self) -> None:
-        with pytest.raises(ValidationError):
-            IVMTRTokenResponse.model_validate(
-                {"access_token": "at", "token_type": "Bearer", "expires_in": 3600}
-            )
+    def test_missing_refresh_token_is_optional(self) -> None:
+        """USPS's IV-MTR endpoint doesn't always return a refresh_token
+        on renewal (empirically verified 2026-04 against live service).
+        The model accepts its absence; the client re-authenticates with
+        username+password when refresh_token is None."""
+        token = IVMTRTokenResponse.model_validate(
+            {"access_token": "at", "token_type": "Bearer", "expires_in": 3600}
+        )
+        assert token.refresh_token is None
 
 
 class TestOAuthErrorResponse:

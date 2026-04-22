@@ -54,6 +54,7 @@ AveryMode = Literal["single", "fill", "batch"]
 
 _AVERY_COLS = 2
 _AVERY_ROWS = 5
+_TRACKING_LEN = 20  # USPS-B-3200 IMb tracking code length
 
 
 # --------------------------------------------------------------------------- #
@@ -88,11 +89,11 @@ def _tracking_to_components(tracking: str) -> tuple[int, int, int, int]:
         BB TTT MMMMMM    SSSSSSSSS (6-digit MID)
 
     MID length is determined by the first digit: 6-digit MIDs begin
-    with ``9``, 9-digit MIDs begin with ``0``–``8`` (per USPS Mailer ID
+    with ``9``, 9-digit MIDs begin with ``0``-``8`` (per USPS Mailer ID
     allocation rules). We honour that convention; if USPS ever relaxes
     it we'll revisit.
     """
-    if len(tracking) != 20 or not tracking.isdigit():
+    if len(tracking) != _TRACKING_LEN or not tracking.isdigit():
         raise ValueError(f"tracking must be 20 digits, got {tracking!r}")
     barcode_id = int(tracking[0:2])
     service_type = int(tracking[2:5])
@@ -134,16 +135,16 @@ def render_envelope(
     routing: str,
     out: BinaryIO,
     *,
-    human_readable: bool = True,  # noqa: ARG001 — retained for API compat; always True
+    human_readable: bool = True,
 ) -> None:
-    """Render a single #10 envelope PDF (9.5" × 4.125") to ``out``.
+    """Render a single #10 envelope PDF (9.5" x 4.125") to ``out``.
 
     Layout (matching upstream 1997cui/envelope):
 
     * Sender block: top-left, DejaVu Serif 10pt-ish, plain text lines.
     * Recipient block: bottom-right, flex column — barcode bars on
       top, human-readable digits below, recipient address lines below
-      that. Automatic vertical centering inside a 4"×2.5" box anchored
+      that. Automatic vertical centering inside a 4"x2.5" box anchored
       at ``left: 5in; bottom: 0.625in``.
 
     ``human_readable`` is accepted for API compatibility but ignored —
@@ -212,7 +213,7 @@ def render_avery8163(
     start_row: int = 1,
     start_col: int = 1,
 ) -> None:
-    """Render an Avery 8163 sheet of 4"×2" labels to ``out``.
+    """Render an Avery 8163 sheet of 4"x2" labels to ``out``.
 
     Args:
         labels_data: A single :class:`LabelData` (``mode="single"`` or
