@@ -141,6 +141,13 @@ class GenerateForm(BaseModel):
     recipient_city: str = Field(..., min_length=1, max_length=_MAX_FIELD_LEN)
     recipient_state: str = Field(..., min_length=2, max_length=2, pattern=r"^[A-Za-z]{2}$")
     recipient_zip: str = Field(..., pattern=_ZIP_PATTERN)
+    # USPS deliveryPoint (2-digit) returned by /validate_address. When
+    # present, it gets appended to the ZIP+4 to form a ZIP-11 IMb routing
+    # code — the most specific routing USPS supports, used by IV-MTR for
+    # per-delivery-point scan resolution. Always optional; the form's JS
+    # populates it on a successful standardize and clears it on any
+    # subsequent address edit.
+    delivery_point: str | None = Field(default=None, pattern=r"^\d{2}$")
 
 
 class TrackWSRequest(BaseModel):
@@ -158,6 +165,34 @@ class TrackWSRequest(BaseModel):
 def _clean_zip(raw: str) -> str:
     """Strip ZIP hyphen / whitespace; return digits only."""
     return "".join(ch for ch in raw if ch.isdigit())
+
+
+def _build_routing(zip_value: str, delivery_point: str | None) -> str:
+    """Build the 5/9/11-digit IMb routing code for a recipient.
+
+    USPS-B-3200 allows four lengths: 0 (no routing), 5 (ZIP), 9 (ZIP+4),
+    or 11 (ZIP+4 + 2-digit deliveryPoint). Longer = more delivery
+    specificity in IV-MTR scans.
+
+    - 5-digit ZIP or untrusted input → 5-digit routing
+    - ZIP+4 (9 digits) → 9-digit routing
+    - ZIP+4 + 2-digit deliveryPoint → 11-digit routing (best)
+
+    ``delivery_point`` is only trusted if it came alongside a ZIP+4 that
+    USPS itself emitted (the /validate_address JS pairs them). A mismatch
+    (e.g. stale deliveryPoint + a user-edited ZIP) is a silent-miscode
+    hazard, so we only emit 11-digit routing when we have 9 digits of
+    ZIP in hand.
+    """
+    digits = _clean_zip(zip_value)
+    if (
+        len(digits) == 9
+        and delivery_point
+        and len(delivery_point) == 2
+        and delivery_point.isdigit()
+    ):
+        return digits + delivery_point
+    return digits
 
 
 def _day_bucket(epoch_seconds: float | None = None) -> int:
@@ -260,6 +295,7 @@ async def post_generate(
     recipient_zip: Annotated[str, Form()],
     recipient_company: Annotated[str | None, Form()] = None,
     recipient_address2: Annotated[str | None, Form()] = None,
+    delivery_point: Annotated[str | None, Form()] = None,
     settings: Settings = Depends(get_settings_dep),
     locked: tuple[sqlite3.Connection, asyncio.Lock] = Depends(get_db_locked),
 ) -> Response:
@@ -281,6 +317,8 @@ async def post_generate(
             recipient_city=recipient_city,
             recipient_state=recipient_state.upper(),
             recipient_zip=recipient_zip,
+            # Empty-string from form → None so Pydantic's pattern skips.
+            delivery_point=delivery_point or None,
         )
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
@@ -290,7 +328,7 @@ async def post_generate(
     serial: int = await _db_call(lock, db.next_serial, conn, bucket)
 
     tracking = _build_tracking(settings, serial)
-    routing = _clean_zip(form.recipient_zip)
+    routing = _build_routing(form.recipient_zip, form.delivery_point)
     # Validate encoding end-to-end — raises ValueError on any out-of-range field.
     imb.encode(
         settings.BARCODE_ID,

@@ -49,7 +49,10 @@ body {
 }
 
 .barcode-humanreadable {
-    font-size: 10pt;
+    /* Matches envelope.html's .hr-digits (7pt). Keeps the human-readable
+       row as a quiet reference line rather than visually competing with
+       the 11pt recipient address below. */
+    font-size: 7pt;
 }
 
 .recipient-text {

@@ -6,7 +6,7 @@ import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -183,6 +183,65 @@ def test_generate_sets_session(client: TestClient) -> None:
     assert "J. Fixture" in resp.text
 
 
+def _routing_from_generate(client: TestClient, **form_overrides: Any) -> str:
+    """Invoke /generate and return the routing string passed into imb.encode.
+
+    Patching the module-level imb.encode lets us observe what /generate
+    actually feeds the IMb encoder without parsing compressed PDF bytes.
+    """
+    with patch("mailwatch.routes.imb.encode", wraps=__import__("mailwatch.imb", fromlist=["encode"]).encode) as spy:
+        resp = client.post(
+            "/generate",
+            data=_valid_form(**form_overrides),
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303, resp.text
+        # imb.encode(barcode_id, srv_type, mailer_id, serial, routing)
+        return str(spy.call_args.args[4])
+
+
+def test_generate_zip5_emits_5digit_routing(client: TestClient) -> None:
+    """Plain 5-digit ZIP → 5-digit IMb routing (baseline behavior)."""
+    assert _routing_from_generate(client, recipient_zip="20500") == "20500"
+
+
+def test_generate_zip_plus_4_emits_9digit_routing(client: TestClient) -> None:
+    """ZIP+4 only → 9-digit IMb routing (no deliveryPoint trust needed)."""
+    assert _routing_from_generate(client, recipient_zip="20500-0001") == "205000001"
+
+
+def test_generate_with_delivery_point_emits_11digit_routing(
+    client: TestClient,
+) -> None:
+    """ZIP+4 + trusted 2-digit deliveryPoint → 11-digit IMb routing."""
+    assert (
+        _routing_from_generate(
+            client, recipient_zip="20500-0001", delivery_point="23"
+        )
+        == "20500000123"
+    )
+
+
+def test_generate_stale_delivery_point_with_zip5_drops_to_5digit(
+    client: TestClient,
+) -> None:
+    """A 2-digit deliveryPoint paired with a 5-digit ZIP is not trusted."""
+    assert (
+        _routing_from_generate(client, recipient_zip="20500", delivery_point="23")
+        == "20500"
+    )
+
+
+def test_generate_rejects_malformed_delivery_point(client: TestClient) -> None:
+    """A non-2-digit deliveryPoint from a hostile or broken client → 422."""
+    resp = client.post(
+        "/generate",
+        data=_valid_form(delivery_point="abc"),
+        follow_redirects=False,
+    )
+    assert resp.status_code == 422
+
+
 # --------------------------------------------------------------------------- #
 # GET /preview + GET /download/pdf                                            #
 # --------------------------------------------------------------------------- #
@@ -325,6 +384,28 @@ def test_parse_bool_last_unit() -> None:
     assert _parse_bool_last(["1", "0"]) is False
     assert _parse_bool_last(["true"]) is False  # narrow surface — only "1" is truthy
     assert _parse_bool_last(["yes"]) is False
+
+
+def test_build_routing_unit() -> None:
+    """_build_routing: 5 / 9 / 11-digit routing based on inputs.
+
+    An 11-digit routing is only emitted when we have a ZIP+4 *and* a
+    trusted 2-digit deliveryPoint — a bare deliveryPoint paired with a
+    5-digit ZIP is not trusted (would silently miscode).
+    """
+    from mailwatch.routes import _build_routing
+
+    assert _build_routing("20500", None) == "20500"
+    assert _build_routing("20500-0001", None) == "205000001"
+    assert _build_routing("20500-0001", "23") == "20500000123"
+    # Stale deliveryPoint dropped when ZIP is only 5 digits.
+    assert _build_routing("20500", "23") == "20500"
+    # Malformed deliveryPoint ignored.
+    assert _build_routing("20500-0001", "") == "205000001"
+    assert _build_routing("20500-0001", "2") == "205000001"
+    assert _build_routing("20500-0001", "abc") == "205000001"
+    # Hyphen stripped; whitespace tolerated.
+    assert _build_routing("  20500 ", None) == "20500"
 
 
 # --------------------------------------------------------------------------- #

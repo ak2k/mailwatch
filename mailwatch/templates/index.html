@@ -84,6 +84,13 @@
       <button type="button" id="validate-btn">Validate address</button>
       <div id="validate-result" class="validate-result" hidden></div>
     </div>
+
+    {# USPS deliveryPoint (2-digit) — populated by the validate handler JS #}
+    {# when standardization succeeds. Lets /generate build an 11-digit IMb  #}
+    {# routing code (ZIP+4 + deliveryPoint) for per-delivery-point tracking.#}
+    {# Cleared whenever any address field is edited, so a stale deliveryPoint#}
+    {# can't get paired with a different ZIP.                                #}
+    <input type="hidden" name="delivery_point" id="delivery_point" value="">
   </fieldset>
 
   <div class="field actions">
@@ -140,18 +147,51 @@
         }
         validateResult.className = 'validate-result ok';
         var lines = [];
+        var deliveryPoint = '';
         if (r.data.standardized) {
           var s = r.data.standardized;
-          if (s.streetAddress) { lines.push(s.streetAddress); }
-          if (s.secondaryAddress) { lines.push(s.secondaryAddress); }
+          // Overwrite form fields with the standardized shape so /generate
+          // (and the rendered envelope/label) uses the OCR-compliant
+          // street + city + ZIP+4 rather than whatever the user typed.
+          if (s.streetAddress) {
+            document.getElementById('recipient_street').value = s.streetAddress;
+            lines.push(s.streetAddress);
+          }
+          if (s.secondaryAddress != null) {
+            document.getElementById('recipient_address2').value = s.secondaryAddress || '';
+            if (s.secondaryAddress) { lines.push(s.secondaryAddress); }
+          }
+          if (s.city) { document.getElementById('recipient_city').value = s.city; }
+          if (s.state) { document.getElementById('recipient_state').value = s.state; }
+          if (s.full_zip) { document.getElementById('recipient_zip').value = s.full_zip; }
           var tail = [s.city, s.state, s.full_zip || s.ZIPCode].filter(Boolean).join(' ');
           if (tail) { lines.push(tail); }
         }
-        validateResult.textContent = 'Standardized: ' + lines.join(' / ');
+        // Capture deliveryPoint so /generate can emit 11-digit IMb routing.
+        var dp = r.data.additionalInfo && r.data.additionalInfo.deliveryPoint;
+        deliveryPoint = (dp && /^\d{2}$/.test(dp)) ? dp : '';
+        document.getElementById('delivery_point').value = deliveryPoint;
+        var suffix = deliveryPoint
+          ? ' — form updated (11-digit tracking)'
+          : ' — form updated';
+        validateResult.textContent = 'Standardized: ' + lines.join(' / ') + suffix;
       }).catch(function (err) {
         validateResult.className = 'validate-result error';
         validateResult.textContent = 'Network error: ' + err;
       });
+    });
+
+    // A stale deliveryPoint paired with an edited address would produce an
+    // IMb routing that doesn't match the envelope — clear the hidden input
+    // whenever any address field is edited after a successful validate.
+    var dpInput = document.getElementById('delivery_point');
+    ['recipient_street', 'recipient_address2', 'recipient_city',
+     'recipient_state', 'recipient_zip'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el && dpInput) {
+        el.addEventListener('input', function () { dpInput.value = ''; });
+        el.addEventListener('change', function () { dpInput.value = ''; });
+      }
     });
   })();
 </script>
