@@ -85,24 +85,26 @@ def _tracking_to_components(tracking: str) -> tuple[int, int, int, int]:
 
     Per USPS-B-3200 the 20-digit tracking code layout is::
 
-        BB TTT MMMMMMMMM SSSSSS    (9-digit MID)
-        BB TTT MMMMMM    SSSSSSSSS (6-digit MID)
+        BB TTT MMMMMMMMM SSSSSS    (9-digit MID, 6-digit serial)
+        BB TTT MMMMMM    SSSSSSSSS (6-digit MID, 9-digit serial)
 
-    MID length is determined by the first digit: 6-digit MIDs begin
-    with ``9``, 9-digit MIDs begin with ``0``-``8`` (per USPS Mailer ID
-    allocation rules). We honour that convention; if USPS ever relaxes
-    it we'll revisit.
+    MID length is determined by the first MID digit: **9-digit MIDs
+    begin with ``9``**, 6-digit MIDs begin with ``0``-``8``. This
+    matches the inverse invariant used by :func:`mailwatch.imb.encode`
+    when rebuilding ``tracking`` from its component fields.
     """
     if len(tracking) != _TRACKING_LEN or not tracking.isdigit():
         raise ValueError(f"tracking must be 20 digits, got {tracking!r}")
     barcode_id = int(tracking[0:2])
     service_type = int(tracking[2:5])
     if tracking[5] == "9":
-        mailer_id = int(tracking[5:11])
-        serial = int(tracking[11:20])
-    else:
+        # 9-digit MID, 6-digit serial.
         mailer_id = int(tracking[5:14])
         serial = int(tracking[14:20])
+    else:
+        # 6-digit MID, 9-digit serial.
+        mailer_id = int(tracking[5:11])
+        serial = int(tracking[11:20])
     return barcode_id, service_type, mailer_id, serial
 
 
