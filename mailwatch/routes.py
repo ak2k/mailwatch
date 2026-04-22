@@ -167,6 +167,10 @@ def _clean_zip(raw: str) -> str:
     return "".join(ch for ch in raw if ch.isdigit())
 
 
+_ZIP_PLUS_4_LEN = 9  # 5-digit ZIP + 4-digit USPS extension
+_DELIVERY_POINT_LEN = 2  # USPS 2-digit delivery-point suffix
+
+
 def _build_routing(zip_value: str, delivery_point: str | None) -> str:
     """Build the 5/9/11-digit IMb routing code for a recipient.
 
@@ -186,9 +190,9 @@ def _build_routing(zip_value: str, delivery_point: str | None) -> str:
     """
     digits = _clean_zip(zip_value)
     if (
-        len(digits) == 9
+        len(digits) == _ZIP_PLUS_4_LEN
         and delivery_point
-        and len(delivery_point) == 2
+        and len(delivery_point) == _DELIVERY_POINT_LEN
         and delivery_point.isdigit()
     ):
         return digits + delivery_point
@@ -284,6 +288,63 @@ async def get_index(request: Request) -> Response:
     )
 
 
+async def _standardize_for_generate(
+    form: GenerateForm, new_api: NewApiClient
+) -> tuple[dict[str, Any], str | None]:
+    """Best-effort USPS standardization for the ``/generate`` path.
+
+    Returns the ``(recipient_dict, delivery_point)`` pair that /generate
+    should persist to the session and pass to :func:`_build_routing`. On
+    USPS failure (network, upstream 5xx, bad address), falls back to the
+    user's raw form input so a transient outage doesn't block mail
+    generation — the envelope will print with unstandardized text + a
+    5-digit routing code, which is still valid mail.
+
+    Any `delivery_point` override from the client form is preferred only
+    as a fallback for the USPS-failure case — when USPS returns a fresh
+    address, we trust its freshly-emitted deliveryPoint and ignore any
+    stale hidden-input value.
+    """
+    raw_recipient: dict[str, Any] = {
+        "name": form.recipient_name,
+        "company": form.recipient_company,
+        "street": form.recipient_street,
+        "address2": form.recipient_address2,
+        "city": form.recipient_city,
+        "state": form.recipient_state,
+        "zip": form.recipient_zip,
+    }
+    try:
+        addr_req = AddressRequest(
+            firm=form.recipient_company or None,
+            streetAddress=form.recipient_street,
+            secondaryAddress=form.recipient_address2 or None,
+            city=form.recipient_city,
+            state=form.recipient_state,
+            ZIPCode=_clean_zip(form.recipient_zip)[:5],
+        )
+        std = await new_api.validate_address(addr_req)
+    except Exception as exc:  # noqa: BLE001 — intentional fallback on any USPS error
+        logger.warning("standardize failed, using raw form input: %s", exc)
+        return raw_recipient, form.delivery_point
+
+    standardized: dict[str, Any] = {
+        "name": form.recipient_name,
+        "company": std.firm or std.address.firm or form.recipient_company,
+        "street": std.address.streetAddress,
+        "address2": std.address.secondaryAddress,
+        "city": std.address.city,
+        "state": std.address.state,
+        "zip": std.full_zip,
+    }
+    fresh_dp: str | None = None
+    if std.additionalInfo and std.additionalInfo.deliveryPoint:
+        candidate = std.additionalInfo.deliveryPoint
+        if len(candidate) == 2 and candidate.isdigit():
+            fresh_dp = candidate
+    return standardized, fresh_dp
+
+
 @router.post("/generate")
 async def post_generate(
     request: Request,
@@ -298,8 +359,18 @@ async def post_generate(
     delivery_point: Annotated[str | None, Form()] = None,
     settings: Settings = Depends(get_settings_dep),
     locked: tuple[sqlite3.Connection, asyncio.Lock] = Depends(get_db_locked),
+    new_api: NewApiClient = Depends(get_new_api),
 ) -> Response:
     """Allocate a serial, store mail piece in session, redirect to ``/preview``.
+
+    Server-side USPS standardization runs unconditionally so the envelope
+    always prints with OCR-compliant text and the IMb routing picks up
+    ZIP+4 + deliveryPoint (11-digit routing) when USPS knows them. The
+    "Validate address" button on the form remains as an optional preview
+    for users who want to see the standardized shape before submitting;
+    an unvalidated submit gets the same standardization on the server
+    path. On USPS failure (outage, bad address) we fall back to the
+    user's raw input so a flaky upstream doesn't block mail generation.
 
     All output options (envelope size, Avery part, mode, row/col,
     human-readable) are stateless query parameters on ``/preview`` + the
@@ -323,12 +394,14 @@ async def post_generate(
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
+    recipient, effective_dp = await _standardize_for_generate(form, new_api)
+
     conn, lock = locked
     bucket = _day_bucket()
     serial: int = await _db_call(lock, db.next_serial, conn, bucket)
 
     tracking = _build_tracking(settings, serial)
-    routing = _build_routing(form.recipient_zip, form.delivery_point)
+    routing = _build_routing(str(recipient["zip"]), effective_dp)
     # Validate encoding end-to-end — raises ValueError on any out-of-range field.
     imb.encode(
         settings.BARCODE_ID,
@@ -341,15 +414,7 @@ async def post_generate(
     # Session holds the piece-of-mail identity (sender/recipient/serial).
     # Output-format preferences ride on the URL, not the session.
     request.session["sender_address"] = form.sender_address
-    request.session["recipient"] = {
-        "name": form.recipient_name,
-        "company": form.recipient_company,
-        "street": form.recipient_street,
-        "address2": form.recipient_address2,
-        "city": form.recipient_city,
-        "state": form.recipient_state,
-        "zip": form.recipient_zip,
-    }
+    request.session["recipient"] = recipient
     request.session["serial"] = serial
     request.session["tracking"] = tracking
     request.session["routing"] = routing

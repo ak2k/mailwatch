@@ -200,20 +200,61 @@ def _routing_from_generate(client: TestClient, **form_overrides: Any) -> str:
         return str(spy.call_args.args[4])
 
 
-def test_generate_zip5_emits_5digit_routing(client: TestClient) -> None:
-    """Plain 5-digit ZIP → 5-digit IMb routing (baseline behavior)."""
+def test_generate_uses_standardized_routing_11digit(client: TestClient) -> None:
+    """USPS standardization succeeds → routing uses USPS ZIP+4 + deliveryPoint.
+
+    The client fixture mocks validate_address to return ZIP 20500,
+    ZIPPlus4 0005, deliveryPoint 99 regardless of what the user typed.
+    """
+    # Form input is 5-digit ZIP + no delivery_point — USPS response trumps.
+    assert _routing_from_generate(client) == "20500000599"
+
+
+def test_generate_uses_standardized_routing_ignores_stale_form_dp(
+    client: TestClient,
+) -> None:
+    """USPS's freshly-returned deliveryPoint beats any stale form hidden input.
+
+    A client submitting a mismatched ``delivery_point`` must not make the
+    server mis-encode: a successful standardize always wins.
+    """
+    assert _routing_from_generate(client, delivery_point="23") == "20500000599"
+
+
+def test_generate_falls_back_to_form_zip_when_usps_fails(
+    client: TestClient,
+) -> None:
+    """USPS outage → routing falls back to user form input.
+
+    5-digit ZIP + no DP → 5-digit routing.
+    """
+    client.app.state.new_api.validate_address = AsyncMock(
+        side_effect=RuntimeError("USPS down")
+    )
     assert _routing_from_generate(client, recipient_zip="20500") == "20500"
 
 
-def test_generate_zip_plus_4_emits_9digit_routing(client: TestClient) -> None:
-    """ZIP+4 only → 9-digit IMb routing (no deliveryPoint trust needed)."""
-    assert _routing_from_generate(client, recipient_zip="20500-0001") == "205000001"
+def test_generate_fallback_uses_form_zip_plus_4(client: TestClient) -> None:
+    """USPS outage with ZIP+4 form input → 9-digit routing from the user's hyphen."""
+    client.app.state.new_api.validate_address = AsyncMock(
+        side_effect=RuntimeError("USPS down")
+    )
+    assert (
+        _routing_from_generate(client, recipient_zip="20500-0001") == "205000001"
+    )
 
 
-def test_generate_with_delivery_point_emits_11digit_routing(
-    client: TestClient,
-) -> None:
-    """ZIP+4 + trusted 2-digit deliveryPoint → 11-digit IMb routing."""
+def test_generate_fallback_uses_form_delivery_point(client: TestClient) -> None:
+    """USPS outage + form-provided delivery_point → 11-digit routing.
+
+    The stale-deliveryPoint protection (only trust DP paired with a ZIP+4)
+    still applies on the fallback path — the /validate_address JS already
+    clears delivery_point when ZIP is edited, so a form-carried DP reflects
+    a previously-successful validate.
+    """
+    client.app.state.new_api.validate_address = AsyncMock(
+        side_effect=RuntimeError("USPS down")
+    )
     assert (
         _routing_from_generate(
             client, recipient_zip="20500-0001", delivery_point="23"
@@ -222,14 +263,29 @@ def test_generate_with_delivery_point_emits_11digit_routing(
     )
 
 
-def test_generate_stale_delivery_point_with_zip5_drops_to_5digit(
-    client: TestClient,
-) -> None:
-    """A 2-digit deliveryPoint paired with a 5-digit ZIP is not trusted."""
+def test_generate_fallback_drops_stale_dp_with_zip5(client: TestClient) -> None:
+    """USPS outage + 5-digit ZIP + stale DP → 5-digit routing (DP dropped)."""
+    client.app.state.new_api.validate_address = AsyncMock(
+        side_effect=RuntimeError("USPS down")
+    )
     assert (
         _routing_from_generate(client, recipient_zip="20500", delivery_point="23")
         == "20500"
     )
+
+
+def test_generate_standardizes_session_recipient(client: TestClient) -> None:
+    """Session-stored recipient should be the USPS standardized shape.
+
+    The fixture returns uppercase "1600 PENNSYLVANIA AVE NW" / "WASHINGTON"
+    / ZIP "20500-0005". After /generate, a follow-up GET / should pre-fill
+    the form with those standardized values rather than the raw input.
+    """
+    _submit_generate(client, recipient_street="1600 Pennsylvania Ave NW")
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "1600 PENNSYLVANIA AVE NW" in resp.text
+    assert "20500-0005" in resp.text
 
 
 def test_generate_rejects_malformed_delivery_point(client: TestClient) -> None:
