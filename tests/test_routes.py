@@ -137,24 +137,39 @@ def _valid_form(**overrides: Any) -> dict[str, Any]:
         "recipient_state": "DC",
         "recipient_zip": "20500",
         "format_type": "envelope",
-        "row": "1",
-        "col": "1",
     }
     base.update({k: str(v) for k, v in overrides.items()})
     return base
 
 
 def _submit_generate(client: TestClient, **overrides: Any) -> Any:
-    resp = client.post("/generate", data=_valid_form(**overrides))
+    """POST /generate and follow its 303 to /preview. Returns the preview response."""
+    resp = client.post("/generate", data=_valid_form(**overrides), follow_redirects=True)
     assert resp.status_code == 200, resp.text
     return resp
 
 
-def test_generate_happy_path_renders_preview(client: TestClient) -> None:
+def test_generate_redirects_to_preview(client: TestClient) -> None:
+    """POST /generate returns 303 → /preview?fmt=<format> (no HTML body)."""
+    resp = client.post("/generate", data=_valid_form(), follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/preview?fmt=envelope"
+
+
+def test_generate_avery_redirects_to_avery_preview(client: TestClient) -> None:
+    resp = client.post(
+        "/generate",
+        data=_valid_form(format_type="avery"),
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/preview?fmt=avery"
+
+
+def test_generate_happy_path_preview_has_embed(client: TestClient) -> None:
     resp = _submit_generate(client)
-    assert "Envelope generated" in resp.text
-    assert "Download PDF" in resp.text
-    # Tracking link should be populated.
+    assert "Preview &amp; download" in resp.text or "Preview & download" in resp.text
+    assert 'type="application/pdf"' in resp.text
     assert "/tracking?serial=" in resp.text
 
 
@@ -170,42 +185,127 @@ def test_generate_invalid_state_is_422(client: TestClient) -> None:
 
 def test_generate_sets_session(client: TestClient) -> None:
     _submit_generate(client)
-    # The session cookie is set — the prefill test exercises this too, but
-    # we also confirm the tracking page picks up the serial query string.
     resp = client.get("/")
     assert "J. Fixture" in resp.text
 
 
 # --------------------------------------------------------------------------- #
-# GET /download/{format}/{doc}                                                #
+# GET /preview + GET /download/pdf                                            #
 # --------------------------------------------------------------------------- #
 
 
-def test_download_pdf_envelope(client: TestClient) -> None:
+def test_preview_without_session_is_400(client: TestClient) -> None:
+    resp = client.get("/preview")
+    assert resp.status_code == 400
+
+
+def test_preview_default_query_renders(client: TestClient) -> None:
     _submit_generate(client)
-    resp = client.get("/download/envelope/pdf")
+    resp = client.get("/preview", params={"fmt": "envelope"})
+    assert resp.status_code == 200
+    assert 'src="/download/pdf?' in resp.text
+    # The PDF URL should reflect the defaults so the embed has a usable target.
+    assert "size=%2310" in resp.text  # "#10" URL-encoded
+    assert "part=8163" in resp.text
+
+
+def test_preview_rejects_unknown_size(client: TestClient) -> None:
+    _submit_generate(client)
+    resp = client.get("/preview", params={"fmt": "envelope", "size": "#99"})
+    assert resp.status_code == 400
+
+
+def test_preview_rejects_unknown_part(client: TestClient) -> None:
+    _submit_generate(client)
+    resp = client.get("/preview", params={"fmt": "avery", "part": "9999"})
+    assert resp.status_code == 400
+
+
+def test_download_pdf_envelope_default(client: TestClient) -> None:
+    _submit_generate(client)
+    resp = client.get("/download/pdf", params={"fmt": "envelope"})
     assert resp.status_code == 200
     assert resp.headers["content-type"] == "application/pdf"
     assert resp.content.startswith(b"%PDF-")
 
 
-def test_download_pdf_avery(client: TestClient) -> None:
-    _submit_generate(client, format_type="avery", row=2, col=1)
-    resp = client.get("/download/avery/pdf")
+def test_download_pdf_envelope_different_size(client: TestClient) -> None:
+    _submit_generate(client)
+    resp = client.get("/download/pdf", params={"fmt": "envelope", "size": "A7"})
     assert resp.status_code == 200
     assert resp.content.startswith(b"%PDF-")
 
 
-def test_download_preview_renders_embed(client: TestClient) -> None:
-    _submit_generate(client)
-    resp = client.get("/download/envelope/preview")
+def test_download_pdf_avery(client: TestClient) -> None:
+    _submit_generate(client, format_type="avery")
+    resp = client.get(
+        "/download/pdf",
+        params={"fmt": "avery", "part": "8163", "mode": "fill", "row": 2, "col": 1},
+    )
     assert resp.status_code == 200
-    assert 'type="application/pdf"' in resp.text
+    assert resp.content.startswith(b"%PDF-")
 
 
-def test_download_without_session_is_400(client: TestClient) -> None:
-    resp = client.get("/download/envelope/pdf")
+def test_download_pdf_avery_other_part(client: TestClient) -> None:
+    _submit_generate(client, format_type="avery")
+    resp = client.get(
+        "/download/pdf",
+        params={"fmt": "avery", "part": "5160", "mode": "fill"},
+    )
+    assert resp.status_code == 200
+    assert resp.content.startswith(b"%PDF-")
+
+
+def test_download_pdf_without_session_is_400(client: TestClient) -> None:
+    resp = client.get("/download/pdf", params={"fmt": "envelope"})
     assert resp.status_code == 400
+
+
+def test_hr_flag_toggles(client: TestClient) -> None:
+    """hr=0 renders a valid PDF just like hr=1; the difference is visual only."""
+    _submit_generate(client)
+    on = client.get("/download/pdf", params={"fmt": "envelope", "hr": "1"})
+    off = client.get("/download/pdf", params={"fmt": "envelope", "hr": "0"})
+    assert on.status_code == 200
+    assert off.status_code == 200
+    # Same serial + recipient → PDFs should differ only because of the hr toggle.
+    assert on.content != off.content
+
+
+# --------------------------------------------------------------------------- #
+# Regen stability — changing output options must NOT allocate a new serial    #
+# --------------------------------------------------------------------------- #
+
+
+def test_preview_regen_keeps_same_serial(client: TestClient) -> None:
+    """Changing size / part / mode / hr must not mint a new IMb serial.
+
+    Protection against a future refactor that accidentally turns option
+    changes into round-trips through ``/generate``.
+    """
+    _submit_generate(client)
+    # Grab the serial from the first preview page.
+    resp1 = client.get("/preview", params={"fmt": "envelope"})
+    # Each size change should hit /preview with a different query but the
+    # same session-held serial. Parse the tracking link out of the HTML
+    # instead of poking at internal cookie state.
+    import re
+
+    m1 = re.search(r"/tracking\?serial=(\d+)", resp1.text)
+    assert m1, resp1.text
+    serial1 = m1.group(1)
+
+    for size in ("A7", "#11", "#6_3/4"):
+        resp = client.get("/preview", params={"fmt": "envelope", "size": size})
+        assert resp.status_code == 200, (size, resp.text)
+        m = re.search(r"/tracking\?serial=(\d+)", resp.text)
+        assert m and m.group(1) == serial1, (size, resp.text)
+
+    # Same expectation when switching to Avery.
+    resp2 = client.get("/preview", params={"fmt": "avery", "part": "5163"})
+    assert resp2.status_code == 200
+    m2 = re.search(r"/tracking\?serial=(\d+)", resp2.text)
+    assert m2 and m2.group(1) == serial1
 
 
 # --------------------------------------------------------------------------- #

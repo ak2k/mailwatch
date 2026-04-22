@@ -21,6 +21,7 @@ import sqlite3
 from pathlib import Path
 from time import time as _now
 from typing import Annotated, Any, Literal
+from urllib.parse import urlencode
 
 from fastapi import (
     APIRouter,
@@ -31,12 +32,14 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, ValidationError
 
 from mailwatch import db, imb, pdf
+from mailwatch.avery import AVERY, DEFAULT_AVERY, DISPLAY_NAMES as _AVERY_LABELS
 from mailwatch.config import Settings
+from mailwatch.layouts import DEFAULT_ENVELOPE, DISPLAY_NAMES as _ENVELOPE_LABELS, ENVELOPES
 from mailwatch.models import AddressRequest, PushFeedPayload
 from mailwatch.usps_api import IVMTRClient, NewApiClient
 
@@ -111,6 +114,11 @@ class GenerateForm(BaseModel):
     Accepts the flat form fields the ``index.html`` template submits. ZIP
     format (``12345`` or ``12345-6789``) is enforced here so the handler
     can assume clean input.
+
+    Output options (envelope size, Avery part, row/col, human-readable,
+    etc.) are NOT on this form — they live on the preview page as query
+    parameters, so changing them regenerates the PDF without touching
+    the session or the allocated IMb serial.
     """
 
     sender_address: str = Field(..., min_length=1)
@@ -122,14 +130,6 @@ class GenerateForm(BaseModel):
     recipient_state: str = Field(..., min_length=2, max_length=2, pattern=r"^[A-Za-z]{2}$")
     recipient_zip: str = Field(..., pattern=_ZIP_PATTERN)
     format_type: Literal["envelope", "avery"] = "envelope"
-    row: int = Field(1, ge=1, le=5)
-    col: int = Field(1, ge=1, le=2)
-    # Avery-only: "single" prints one label at (row, col), "fill" (default)
-    # repeats the recipient into every remaining slot on the sheet.
-    avery_mode: Literal["single", "fill"] = "fill"
-    # Human-readable digit line directly below the barcode bars.
-    # Defaults on; pass false to render bars only.
-    human_readable: bool = True
 
 
 class TrackWSRequest(BaseModel):
@@ -202,16 +202,24 @@ def _sender_lines(sender_address: str) -> list[str]:
 
 @router.get("/", response_class=HTMLResponse)
 async def get_index(request: Request) -> Response:
-    """Render the generate form. Pre-fills sender from session when present."""
-    sender_address = request.session.get("sender_address", "")
+    """Render the data-entry form.
+
+    Pre-fills sender + recipient from session when present so the "Edit
+    recipient (new serial)" link on the preview page can bounce back here
+    without losing context. Output-format options (size, part, mode, etc.)
+    do NOT live here — they're on the preview page.
+    """
     return templates.TemplateResponse(
         request,
         "index.html",
-        {"sender_address": sender_address},
+        {
+            "sender_address": request.session.get("sender_address", ""),
+            "recipient": request.session.get("recipient"),
+        },
     )
 
 
-@router.post("/generate", response_class=HTMLResponse)
+@router.post("/generate")
 async def post_generate(
     request: Request,
     sender_address: Annotated[str, Form()],
@@ -223,21 +231,16 @@ async def post_generate(
     recipient_company: Annotated[str | None, Form()] = None,
     recipient_address2: Annotated[str | None, Form()] = None,
     format_type: Annotated[Literal["envelope", "avery"], Form()] = "envelope",
-    row: Annotated[int, Form()] = 1,
-    col: Annotated[int, Form()] = 1,
-    avery_mode: Annotated[Literal["single", "fill"], Form()] = "fill",
-    # HTML checkboxes only transmit when checked. The form's checkbox
-    # is pre-checked on page load, so a submit with no user interaction
-    # arrives as `human_readable=true` → True. If the user explicitly
-    # unchecks it, the field is absent and we default to False.
-    human_readable: Annotated[bool, Form()] = False,
     settings: Settings = Depends(get_settings_dep),
     locked: tuple[sqlite3.Connection, asyncio.Lock] = Depends(get_db_locked),
 ) -> Response:
-    """Generate an IMb + return the preview page.
+    """Allocate a serial, store mail piece in session, redirect to ``/preview``.
 
-    Input validation happens via the :class:`GenerateForm` pydantic model —
-    any failure is surfaced as a 422 with field-level detail.
+    All output options (envelope size, Avery part, mode, row/col,
+    human-readable) are stateless query parameters on ``/preview`` + the
+    PDF download URL. Nothing about them is persisted to the session,
+    so the user can regen by clicking radios without ever re-hitting
+    ``/generate`` — the serial stays stable.
     """
     try:
         form = GenerateForm(
@@ -250,10 +253,6 @@ async def post_generate(
             recipient_state=recipient_state.upper(),
             recipient_zip=recipient_zip,
             format_type=format_type,
-            row=row,
-            col=col,
-            avery_mode=avery_mode,
-            human_readable=human_readable,
         )
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
@@ -273,8 +272,8 @@ async def post_generate(
         routing,
     )
 
-    # Session holds UI state only (sender text + recipient block + serial) —
-    # never tokens or other secrets.
+    # Session holds the piece-of-mail identity (sender/recipient/serial).
+    # Output-format preferences ride on the URL, not the session.
     request.session["sender_address"] = form.sender_address
     request.session["recipient"] = {
         "name": form.recipient_name,
@@ -288,103 +287,184 @@ async def post_generate(
     request.session["serial"] = serial
     request.session["tracking"] = tracking
     request.session["routing"] = routing
-    request.session["format_type"] = form.format_type
-    request.session["row"] = form.row
-    request.session["col"] = form.col
-    request.session["avery_mode"] = form.avery_mode
-    request.session["human_readable"] = form.human_readable
 
-    pdf_url = f"/download/{form.format_type}/pdf"
-    tracking_url = f"/tracking?serial={serial}&zip={form.recipient_zip}"
+    # 303 = "see other" — turns the POST into a GET for the redirect target,
+    # so refreshing the preview page doesn't resubmit the form.
+    return RedirectResponse(
+        url=f"/preview?fmt={form.format_type}",
+        status_code=303,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Preview + PDF download                                                      #
+# --------------------------------------------------------------------------- #
+
+# Session model:
+#  - FastAPI SessionMiddleware, cookie-backed, HttpOnly + SameSite=Lax
+#    (Secure in production via create_app(session_https_only=True)).
+#  - Holds: {sender_address, recipient, serial, tracking, routing}.
+#  - Lifetime: browser-close = gone (no server-side store).
+#  - Single-user service: no inter-tab lock. Two tabs = two cookies =
+#    two independent serials, which is the intuitive behavior.
+#  - Serial stability: allocated once at /generate, preserved across
+#    every /preview option change. Only "Edit recipient" → /generate
+#    allocates a fresh serial.
+
+
+def _require_session_piece(request: Request) -> dict[str, Any]:
+    """Extract the session-held mail piece or raise 400."""
+    recipient = request.session.get("recipient")
+    serial = request.session.get("serial")
+    tracking = request.session.get("tracking")
+    routing = request.session.get("routing")
+    sender_address = request.session.get("sender_address")
+    if not (recipient and serial is not None and tracking and sender_address):
+        raise HTTPException(
+            status_code=400,
+            detail="No envelope in session; generate one first.",
+        )
+    return {
+        "sender_address": sender_address,
+        "recipient": recipient,
+        "serial": serial,
+        "tracking": tracking,
+        "routing": routing or "",
+    }
+
+
+def _parse_hr(value: str | None) -> bool:
+    """Query-string bool: truthy if '1'/'true'/'on'/'yes' (case-insensitive)."""
+    if value is None:
+        return True
+    return value.strip().lower() in {"1", "true", "on", "yes"}
+
+
+@router.get("/preview", response_class=HTMLResponse)
+async def get_preview(
+    request: Request,
+    fmt: Literal["envelope", "avery"] = "envelope",
+    size: str = DEFAULT_ENVELOPE,
+    part: str = DEFAULT_AVERY,
+    mode: Literal["single", "fill"] = "fill",
+    row: int = 1,
+    col: int = 1,
+    hr: str | None = None,
+) -> Response:
+    """Render the preview page with the current output options.
+
+    All option state lives in the URL — changing a radio / select in the
+    preview form navigates back to this route with different query params
+    and the PDF embed reloads. No POST, no session mutation, no new
+    serial.
+    """
+    piece = _require_session_piece(request)
+    if size not in ENVELOPES:
+        raise HTTPException(status_code=400, detail=f"unknown envelope size: {size}")
+    if part not in AVERY:
+        raise HTTPException(status_code=400, detail=f"unknown Avery part: {part}")
+
+    tpl = AVERY[part]
+    # Clamp row/col to the chosen Avery part's grid so a stale URL from a
+    # bigger-grid part doesn't 500 on the downstream render.
+    row = max(1, min(row, tpl.rows))
+    col = max(1, min(col, tpl.cols))
+    hr_on = _parse_hr(hr)
+
+    # Envelope keys contain '#' / '/' which must be percent-encoded so the
+    # browser doesn't treat them as fragment / path separators.
+    qs = urlencode(
+        {
+            "fmt": fmt,
+            "size": size,
+            "part": part,
+            "mode": mode,
+            "row": row,
+            "col": col,
+            "hr": "1" if hr_on else "0",
+        }
+    )
+    pdf_url = f"/download/pdf?{qs}"
+    tracking_url = f"/tracking?serial={piece['serial']}&zip={piece['recipient']['zip']}"
+
     return templates.TemplateResponse(
         request,
-        "generate.html",
+        "preview.html",
         {
-            "serial": serial,
-            "recipient_zip": form.recipient_zip,
+            "serial": piece["serial"],
+            "recipient_zip": piece["recipient"]["zip"],
+            "fmt": fmt,
+            "size": size,
+            "part": part,
+            "mode": mode,
+            "row": row,
+            "col": col,
+            "hr": hr_on,
+            "envelope_choices": list(_ENVELOPE_LABELS.items()),
+            "avery_choices": list(_AVERY_LABELS.items()),
+            "avery_max_row": tpl.rows,
+            "avery_max_col": tpl.cols,
             "pdf_url": pdf_url,
             "tracking_url": tracking_url,
         },
     )
 
 
-@router.get("/download/{format_type}/{doc_type}")
-async def get_download(
+@router.get("/download/pdf")
+async def get_download_pdf(
     request: Request,
-    format_type: Literal["envelope", "avery"],
-    doc_type: Literal["pdf", "preview"],
-    settings: Settings = Depends(get_settings_dep),
+    fmt: Literal["envelope", "avery"] = "envelope",
+    size: str = DEFAULT_ENVELOPE,
+    part: str = DEFAULT_AVERY,
+    mode: Literal["single", "fill"] = "fill",
+    row: int = 1,
+    col: int = 1,
+    hr: str | None = None,
 ) -> Response:
-    """Render the previously generated envelope/label as a PDF or preview page.
+    """Render the session's mail piece as a PDF using the given options."""
+    piece = _require_session_piece(request)
+    if size not in ENVELOPES:
+        raise HTTPException(status_code=400, detail=f"unknown envelope size: {size}")
+    if part not in AVERY:
+        raise HTTPException(status_code=400, detail=f"unknown Avery part: {part}")
 
-    Session is the source of truth for sender/recipient/serial — there is
-    no server-side state keyed by session (besides the serial counter,
-    which already advanced on ``/generate``). If the session is missing
-    the required keys the caller either skipped ``/generate`` or the
-    cookie expired; respond 400 either way.
-    """
-    sender_address = request.session.get("sender_address")
-    recipient = request.session.get("recipient")
-    serial = request.session.get("serial")
-    tracking = request.session.get("tracking")
-    routing = request.session.get("routing")
-    if not (sender_address and recipient and serial is not None and tracking and routing):
-        raise HTTPException(status_code=400, detail="No envelope in session; generate one first.")
-
-    if doc_type == "preview":
-        pdf_url = f"/download/{format_type}/pdf"
-        tracking_url = f"/tracking?serial={serial}&zip={recipient['zip']}"
-        return templates.TemplateResponse(
-            request,
-            "generate.html",
-            {
-                "serial": serial,
-                "recipient_zip": recipient["zip"],
-                "pdf_url": pdf_url,
-                "tracking_url": tracking_url,
-            },
-        )
-
-    # doc_type == "pdf" — render via WeasyPrint. The renderers are sync,
-    # so dispatch to a worker thread.
-    sender_lines_val = _sender_lines(sender_address)
-    recipient_lines_val = _recipient_lines_from_session(recipient)
-    human_readable = bool(request.session.get("human_readable", True))
+    sender_lines_val = _sender_lines(piece["sender_address"])
+    recipient_lines_val = _recipient_lines_from_session(piece["recipient"])
+    hr_on = _parse_hr(hr)
 
     buf = io.BytesIO()
-    if format_type == "envelope":
+    if fmt == "envelope":
         await asyncio.to_thread(
             pdf.render_envelope,
             sender_lines_val,
             recipient_lines_val,
-            tracking,
-            routing,
+            piece["tracking"],
+            piece["routing"],
             buf,
-            human_readable=human_readable,
+            envelope_size=size,
+            human_readable=hr_on,
         )
-        filename = f"envelope-{serial}.pdf"
+        filename = f"envelope-{piece['serial']}.pdf"
     else:
+        tpl = AVERY[part]
+        row = max(1, min(row, tpl.rows))
+        col = max(1, min(col, tpl.cols))
         label: pdf.LabelData = {
             "recipient": recipient_lines_val,
-            "tracking": tracking,
-            "routing": routing,
+            "tracking": piece["tracking"],
+            "routing": piece["routing"],
         }
-        start_row = request.session.get("row", 1)
-        start_col = request.session.get("col", 1)
-        avery_mode: pdf.AveryMode = request.session.get("avery_mode", "fill")
         await asyncio.to_thread(
-            pdf.render_avery8163,
+            pdf.render_avery,
             label,
             buf,
-            mode=avery_mode,
-            start_row=start_row,
-            start_col=start_col,
-            human_readable=human_readable,
+            part=part,
+            mode=mode,
+            start_row=row,
+            start_col=col,
+            human_readable=hr_on,
         )
-        filename = f"avery-{serial}.pdf"
-
-    # Avoid mypy flagging unused settings param — keep signature uniform.
-    del settings
+        filename = f"avery-{part}-{piece['serial']}.pdf"
 
     return Response(
         content=buf.getvalue(),

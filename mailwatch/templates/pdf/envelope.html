@@ -5,10 +5,11 @@
 	<title>Envelope</title>
 </head>
 <style>
-/* WeasyPrint uses @page for page dimensions — upstream's wkhtmltopdf
-   was given --page-width / --page-height on the command line instead. */
+/* @page size comes from mailwatch.layouts — one spec per envelope size.
+   The block geometry below also reads from spec, so adding a new size
+   means one row in ENVELOPES, not a template edit. */
 @page {
-    size: 9.5in 4.125in;
+    size: {{ spec.w }}in {{ spec.h }}in;
     margin: 0;
 }
 
@@ -29,66 +30,83 @@ body {
 }
 
 .envelope {
-    width: 9.5in;
-    height: 4.125in;
-    padding: 0.25in;
-    transform-origin: left top;
+    position: relative;
+    width: {{ spec.w }}in;
+    height: {{ spec.h }}in;
     page-break-after: always;
+}
+
+/* Each of the three blocks declares its max extent and clips overflow, so
+   rendered content cannot escape the rectangle _validate() proved was
+   collision-free at module load. */
+.sender {
     position: absolute;
-}
-
-.sender-address {
-    width: 4in;
-    height: 1.5in;
-    position: absolute;
-    font-family: "DejaVu Serif",serif;
-}
-
-.recipient-address {
-    width: 4in;
-    height: 2.5in;
-    position: absolute;
-    left: 5in;
-    bottom: 0.625in;
-    display: flex;
-    display: -webkit-box;
-    flex-direction: column;
-    justify-content: center;
-    -webkit-box-pack: center;
-    -webkit-box-orient: vertical;
-}
-
-.usps-barcode {
-    font-family: "USPSIMBStandard";
-    font-size: 16pt;
-    margin-bottom: 0.1in;
-}
-
-.barcode-humanreadable {
+    left: {{ spec.sender.x }}in;
+    bottom: {{ spec.sender.y }}in;
+    width: {{ spec.sender.w }}in;
+    height: {{ spec.sender.h }}in;
+    max-width: {{ spec.sender.w }}in;
+    max-height: {{ spec.sender.h }}in;
+    overflow: hidden;
+    font-family: "DejaVu Serif", serif;
     font-size: 10pt;
 }
 
-.recipient-text {
-    font-family: "DejaVu Serif",serif;
+.recipient {
+    position: absolute;
+    left: {{ spec.recipient.x }}in;
+    bottom: {{ spec.recipient.y }}in;
+    width: {{ spec.recipient.w }}in;
+    height: {{ spec.recipient.h }}in;
+    max-width: {{ spec.recipient.w }}in;
+    max-height: {{ spec.recipient.h }}in;
+    overflow: hidden;
+    font-family: "DejaVu Serif", serif;
+    font-size: 11pt;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+
+.barcode {
+    position: absolute;
+    left: {{ spec.barcode.x }}in;
+    bottom: {{ spec.barcode.y }}in;
+    width: {{ spec.barcode.w }}in;
+    height: {{ spec.barcode.h }}in;
+    max-width: {{ spec.barcode.w }}in;
+    max-height: {{ spec.barcode.h }}in;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+}
+
+.bars {
+    font-family: "USPSIMBStandard";
+    font-size: 16pt;
+    line-height: 1;
+}
+
+.hr-digits {
+    font-family: "DejaVu Serif", serif;
+    font-size: 7pt;
+    margin-bottom: 1pt;
 }
 
 </style>
 <body>
-	<div class="envelope">
-		<div class="sender-address">
-			{% for line in sender_lines %}{{ line }}<br/>
-			{% endfor %}
-		</div>
-		<div class="recipient-address">
-			<div class="usps-barcode">{{ barcode_bars }}</div>
-			{% if human_readable %}
-			<div class="barcode-humanreadable">{{ human_readable_text }}</div>
-			{% endif %}
-			<div class="recipient-text">
-				{% for line in recipient_lines %}{{ line }}<br/>
-				{% endfor %}
-			</div>
-		</div>
-	</div>
+    <div class="envelope">
+        <div class="sender">
+            {% for line in sender_lines %}{{ line }}<br/>{% endfor %}
+        </div>
+        <div class="recipient">
+            {% for line in recipient_lines %}{{ line }}<br/>{% endfor %}
+        </div>
+        <div class="barcode">
+            {% if human_readable %}<div class="hr-digits">{{ human_readable_text }}</div>{% endif %}
+            <div class="bars">{{ barcode_bars }}</div>
+        </div>
+    </div>
 </body>
 </html>

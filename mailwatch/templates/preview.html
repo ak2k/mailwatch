@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+
+{% block title %}mailwatch &middot; preview{% endblock %}
+
+{% block content %}
+<h1>Preview &amp; download</h1>
+
+<section class="callout">
+  <p class="callout-lead">Save these to track your letter:</p>
+  <p class="tracking-id">
+    Tracking: <code>{{ serial }}</code> / <code>{{ recipient_zip }}</code>
+  </p>
+  <p class="muted">
+    Changing output options below regenerates the PDF without touching the
+    tracking number.
+  </p>
+</section>
+
+<section class="stack">
+  <form id="options-form" method="get" action="/preview" class="stack">
+    <fieldset>
+      <legend>Output format</legend>
+      <div class="field radios">
+        <label class="radio">
+          <input type="radio" name="fmt" value="envelope" {% if fmt == 'envelope' %}checked{% endif %}>
+          Envelope
+        </label>
+        <label class="radio">
+          <input type="radio" name="fmt" value="avery" {% if fmt == 'avery' %}checked{% endif %}>
+          Avery label sheet
+        </label>
+      </div>
+
+      <div class="field" id="envelope-opts" {% if fmt != 'envelope' %}hidden{% endif %}>
+        <label for="size">Envelope size</label>
+        <select id="size" name="size">
+          {% for key, label in envelope_choices %}
+          <option value="{{ key }}" {% if key == size %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="stack" id="avery-opts" {% if fmt != 'avery' %}hidden{% endif %}>
+        <div class="field">
+          <label for="part">Avery part</label>
+          <select id="part" name="part">
+            {% for key, label in avery_choices %}
+            <option value="{{ key }}" {% if key == part %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field radios">
+          <label class="radio">
+            <input type="radio" name="mode" value="fill" {% if mode == 'fill' %}checked{% endif %}>
+            Fill — repeat the recipient into every remaining slot
+          </label>
+          <label class="radio">
+            <input type="radio" name="mode" value="single" {% if mode == 'single' %}checked{% endif %}>
+            Single — one label at (row, column)
+          </label>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="row">Start row</label>
+            <input type="number" id="row" name="row" min="1" max="{{ avery_max_row }}" value="{{ row }}">
+          </div>
+          <div class="field">
+            <label for="col">Start column</label>
+            <input type="number" id="col" name="col" min="1" max="{{ avery_max_col }}" value="{{ col }}">
+          </div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="checkbox">
+          <input type="checkbox" name="hr" value="1" {% if hr %}checked{% endif %}>
+          Print the tracking number in digits next to the barcode
+        </label>
+      </div>
+    </fieldset>
+
+    <div class="field actions">
+      <button type="submit" class="primary">Apply &amp; regenerate</button>
+    </div>
+  </form>
+
+  <h2>Preview</h2>
+  <div class="pdf-preview">
+    <embed src="{{ pdf_url }}" type="application/pdf" width="100%" height="600px">
+  </div>
+
+  <p class="actions">
+    <a class="button-link primary" href="{{ pdf_url }}" download>Download PDF</a>
+    <button type="button" id="print-btn" class="button-link">Print</button>
+    <a class="button-link" href="{{ tracking_url }}">Track this letter</a>
+    <a class="button-link" href="/">Edit recipient (new serial)</a>
+  </p>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function () {
+    var printBtn = document.getElementById('print-btn');
+    if (printBtn) {
+      printBtn.addEventListener('click', function () { window.print(); });
+    }
+
+    // Toggle envelope/avery option panels when the format radio changes,
+    // and auto-submit the form on any option change so the user doesn't
+    // have to hit "Apply" after every click.
+    var form = document.getElementById('options-form');
+    var envelopeOpts = document.getElementById('envelope-opts');
+    var averyOpts = document.getElementById('avery-opts');
+
+    function syncPanels() {
+      var sel = form.querySelector('input[name="fmt"]:checked');
+      var isEnvelope = sel && sel.value === 'envelope';
+      envelopeOpts.hidden = !isEnvelope;
+      averyOpts.hidden = isEnvelope;
+    }
+    form.addEventListener('change', function (e) {
+      syncPanels();
+      // Auto-submit on format/size/part/mode/hr changes. Skip row/col
+      // (number inputs fire 'change' on blur, which is fine, but users
+      // expect to type without it bouncing).
+      if (e.target && (e.target.name === 'row' || e.target.name === 'col')) {
+        return;
+      }
+      form.submit();
+    });
+    syncPanels();
+  })();
+</script>
+{% endblock %}

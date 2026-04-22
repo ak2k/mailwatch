@@ -5,9 +5,9 @@
 {% block content %}
 <h1>Generate a tracked envelope</h1>
 <p>
-  Fill in sender and recipient addresses, then download a print-ready PDF
-  with a USPS Intelligent Mail barcode. Scans will appear on the
-  <a href="/tracking">tracking page</a> once USPS processes the letter.
+  Fill in sender and recipient addresses, pick a format, and you'll land
+  on a preview page where you can change the envelope size, label part,
+  or other output options without re-entering anything.
 </p>
 
 <form id="generate-form" action="/generate" method="post" class="stack">
@@ -25,63 +25,43 @@
 
     <div class="field">
       <label for="recipient_name">Name</label>
-      <input type="text" id="recipient_name" name="recipient_name" required>
+      <input type="text" id="recipient_name" name="recipient_name" required
+             value="{{ (recipient.name if recipient else '') or '' }}">
     </div>
 
     <div class="field">
       <label for="recipient_company">Company / firm <span class="muted">(optional)</span></label>
-      <input type="text" id="recipient_company" name="recipient_company">
+      <input type="text" id="recipient_company" name="recipient_company"
+             value="{{ (recipient.company if recipient else '') or '' }}">
     </div>
 
     <div class="field">
       <label for="recipient_street">Street address</label>
-      <input type="text" id="recipient_street" name="recipient_street" required>
+      <input type="text" id="recipient_street" name="recipient_street" required
+             value="{{ (recipient.street if recipient else '') or '' }}">
     </div>
 
     <div class="field">
       <label for="recipient_address2">Apt / suite / floor <span class="muted">(optional)</span></label>
-      <input type="text" id="recipient_address2" name="recipient_address2">
+      <input type="text" id="recipient_address2" name="recipient_address2"
+             value="{{ (recipient.address2 if recipient else '') or '' }}">
     </div>
 
     <div class="grid-3">
       <div class="field">
         <label for="recipient_city">City</label>
-        <input type="text" id="recipient_city" name="recipient_city" required>
+        <input type="text" id="recipient_city" name="recipient_city" required
+               value="{{ (recipient.city if recipient else '') or '' }}">
       </div>
 
       <div class="field">
         <label for="recipient_state">State</label>
         <select id="recipient_state" name="recipient_state" required>
-          <option value="" disabled selected>--</option>
-          <option value="AL">AL</option><option value="AK">AK</option>
-          <option value="AZ">AZ</option><option value="AR">AR</option>
-          <option value="CA">CA</option><option value="CO">CO</option>
-          <option value="CT">CT</option><option value="DE">DE</option>
-          <option value="DC">DC</option><option value="FL">FL</option>
-          <option value="GA">GA</option><option value="HI">HI</option>
-          <option value="ID">ID</option><option value="IL">IL</option>
-          <option value="IN">IN</option><option value="IA">IA</option>
-          <option value="KS">KS</option><option value="KY">KY</option>
-          <option value="LA">LA</option><option value="ME">ME</option>
-          <option value="MD">MD</option><option value="MA">MA</option>
-          <option value="MI">MI</option><option value="MN">MN</option>
-          <option value="MS">MS</option><option value="MO">MO</option>
-          <option value="MT">MT</option><option value="NE">NE</option>
-          <option value="NV">NV</option><option value="NH">NH</option>
-          <option value="NJ">NJ</option><option value="NM">NM</option>
-          <option value="NY">NY</option><option value="NC">NC</option>
-          <option value="ND">ND</option><option value="OH">OH</option>
-          <option value="OK">OK</option><option value="OR">OR</option>
-          <option value="PA">PA</option><option value="RI">RI</option>
-          <option value="SC">SC</option><option value="SD">SD</option>
-          <option value="TN">TN</option><option value="TX">TX</option>
-          <option value="UT">UT</option><option value="VT">VT</option>
-          <option value="VA">VA</option><option value="WA">WA</option>
-          <option value="WV">WV</option><option value="WI">WI</option>
-          <option value="WY">WY</option>
-          <option value="AS">AS</option><option value="GU">GU</option>
-          <option value="MP">MP</option><option value="PR">PR</option>
-          <option value="VI">VI</option>
+          {% set cur_state = (recipient.state if recipient else '') or '' %}
+          <option value="" disabled {% if not cur_state %}selected{% endif %}>--</option>
+          {% for st in ["AL","AK","AZ","AR","CA","CO","CT","DE","DC","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY","AS","GU","MP","PR","VI"] %}
+          <option value="{{ st }}" {% if cur_state == st %}selected{% endif %}>{{ st }}</option>
+          {% endfor %}
         </select>
       </div>
 
@@ -89,7 +69,8 @@
         <label for="recipient_zip">ZIP</label>
         <input type="text" id="recipient_zip" name="recipient_zip"
                pattern="\d{5}(-?\d{4})?" required
-               inputmode="numeric" autocomplete="postal-code">
+               inputmode="numeric" autocomplete="postal-code"
+               value="{{ (recipient.zip if recipient else '') or '' }}">
       </div>
     </div>
 
@@ -104,47 +85,17 @@
     <div class="field radios">
       <label class="radio">
         <input type="radio" name="format_type" value="envelope" checked>
-        #10 envelope
+        Envelope — pick a size on the next page
       </label>
       <label class="radio">
         <input type="radio" name="format_type" value="avery">
-        Avery 8163 label sheet
-      </label>
-    </div>
-
-    <div id="avery-options" class="stack" hidden>
-      <div class="field radios">
-        <label class="radio">
-          <input type="radio" name="avery_mode" value="fill" checked>
-          Fill sheet — print the recipient into every remaining slot
-        </label>
-        <label class="radio">
-          <input type="radio" name="avery_mode" value="single">
-          Single — print one label at (row, column) and leave the rest blank
-        </label>
-      </div>
-      <div class="grid-2">
-        <div class="field">
-          <label for="row">Start row</label>
-          <input type="number" id="row" name="row" min="1" max="5" value="1">
-        </div>
-        <div class="field">
-          <label for="col">Start column</label>
-          <input type="number" id="col" name="col" min="1" max="2" value="1">
-        </div>
-      </div>
-    </div>
-
-    <div class="field">
-      <label class="checkbox">
-        <input type="checkbox" name="human_readable" value="true" checked>
-        Print the tracking number in digits below the barcode
+        Avery label sheet — pick a part on the next page
       </label>
     </div>
   </fieldset>
 
   <div class="field actions">
-    <button type="submit" class="primary">Generate</button>
+    <button type="submit" class="primary">Generate &amp; preview</button>
   </div>
 </form>
 
@@ -163,24 +114,9 @@
 {% block scripts %}
 <script>
   (function () {
-    var formatRadios = document.querySelectorAll('input[name="format_type"]');
-    var averyOpts = document.getElementById('avery-options');
-
-    function syncAvery() {
-      var selected = document.querySelector('input[name="format_type"]:checked');
-      if (selected && selected.value === 'avery') {
-        averyOpts.hidden = false;
-      } else {
-        averyOpts.hidden = true;
-      }
-    }
-    formatRadios.forEach(function (r) {
-      r.addEventListener('change', syncAvery);
-    });
-    syncAvery();
-
     var validateBtn = document.getElementById('validate-btn');
     var validateResult = document.getElementById('validate-result');
+    if (!validateBtn) { return; }
 
     validateBtn.addEventListener('click', function () {
       var payload = {

@@ -1,19 +1,21 @@
-"""PDF rendering for USPS-compliant #10 envelopes and Avery 8163 sheets.
+"""PDF rendering for USPS-compliant envelopes and Avery label sheets.
 
 Backed by WeasyPrint + Jinja2 against HTML templates in
 ``mailwatch/templates/pdf/``. The templates embed the USPSIMBStandard
 TrueType font (base64 ``@font-face``) and render the IMb by dropping a
 65-character ``F``/``A``/``D``/``T`` string into a ``<span>`` with that
 font — each glyph is the appropriate ascender / descender / full /
-tracker bar. Layout is plain CSS (flexbox column on the envelope;
-absolute positioning per (row, col) on Avery), so coordinate changes
-are edits to the template, not Python.
+tracker bar.
+
+Page geometry is driven by catalog dicts:
+
+* :data:`mailwatch.layouts.ENVELOPES` — 11 USPS letter envelope sizes,
+  each with block positions proven collision-free at module load.
+* :data:`mailwatch.avery.AVERY` — 11 curated Avery parts covering
+  shipping / address / return-address families in laser + inkjet SKUs.
 
 The two public entry points are synchronous — FastAPI callers wrap
-them in :func:`asyncio.to_thread`. They mirror the pre-WeasyPrint API
-shape (``render_envelope(sender, recipient, tracking, routing, out)``
-and ``render_avery8163(labels_data, out, *, mode, start_row, start_col)``)
-so the routes layer didn't need changes.
+them in :func:`asyncio.to_thread`.
 """
 
 from __future__ import annotations
@@ -25,7 +27,9 @@ from typing import BinaryIO, Literal, TypedDict
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from weasyprint import HTML
 
+from mailwatch.avery import AVERY, DEFAULT_AVERY
 from mailwatch.imb import encode as _imb_encode
+from mailwatch.layouts import DEFAULT_ENVELOPE, ENVELOPES
 
 _TEMPLATE_PACKAGE = "mailwatch.templates.pdf"
 
@@ -36,7 +40,7 @@ _TEMPLATE_PACKAGE = "mailwatch.templates.pdf"
 
 
 class LabelData(TypedDict):
-    """Per-label payload for :func:`render_avery8163`.
+    """Per-label payload for :func:`render_avery`.
 
     ``recipient`` is a list of pre-formatted address lines (rendered
     verbatim — UPPERCASE-conversion is caller responsibility if wanted
@@ -52,8 +56,6 @@ class LabelData(TypedDict):
 
 AveryMode = Literal["single", "fill", "batch"]
 
-_AVERY_COLS = 2
-_AVERY_ROWS = 5
 _TRACKING_LEN = 20  # USPS-B-3200 IMb tracking code length
 
 
@@ -98,11 +100,9 @@ def _tracking_to_components(tracking: str) -> tuple[int, int, int, int]:
     barcode_id = int(tracking[0:2])
     service_type = int(tracking[2:5])
     if tracking[5] == "9":
-        # 9-digit MID, 6-digit serial.
         mailer_id = int(tracking[5:14])
         serial = int(tracking[14:20])
     else:
-        # 6-digit MID, 9-digit serial.
         mailer_id = int(tracking[5:11])
         serial = int(tracking[11:20])
     return barcode_id, service_type, mailer_id, serial
@@ -115,13 +115,7 @@ def _encode_bars(tracking: str, routing: str) -> str:
 
 
 def _human_readable(tracking: str, routing: str) -> str:
-    """Format the human-readable digit line that sits below the bars.
-
-    USPS convention (and upstream) is grouped as
-    ``BB TTT MMMMMMMMM SSSSSS [ZIP]`` for visual scanability. We
-    present the raw tracking + routing with a single space separator —
-    visually close enough and avoids hyphen ambiguity.
-    """
+    """Format the human-readable digit line that sits below the bars."""
     return f"{tracking} {routing}".rstrip()
 
 
@@ -137,26 +131,21 @@ def render_envelope(
     routing: str,
     out: BinaryIO,
     *,
+    envelope_size: str = DEFAULT_ENVELOPE,
     human_readable: bool = True,
 ) -> None:
-    """Render a single #10 envelope PDF (9.5" x 4.125") to ``out``.
-
-    Layout (matching upstream 1997cui/envelope):
-
-    * Sender block: top-left, DejaVu Serif 10pt-ish, plain text lines.
-    * Recipient block: bottom-right, flex column — barcode bars on
-      top, the optional human-readable digit line below the bars, and
-      the recipient address lines below that. Automatic vertical
-      centering inside a 4"x2.5" box anchored at
-      ``left: 5in; bottom: 0.625in``.
+    """Render a single-envelope PDF to ``out``.
 
     Args:
+        envelope_size: Key into :data:`mailwatch.layouts.ENVELOPES`.
+            Defaults to ``#10``. Unknown keys raise :class:`KeyError`.
         human_readable: If True (default), draw the 20-digit tracking
-            + routing ZIP as 6pt text directly below the barcode bars.
-            USPS doesn't require the human-readable line — pass False
-            to omit it.
+            + routing ZIP as small text directly above the barcode bars.
+            USPS doesn't require it — pass False to omit.
     """
+    spec = ENVELOPES[envelope_size]
     html_str = _jinja.get_template("envelope.html").render(
+        spec=spec,
         sender_lines=sender,
         recipient_lines=recipient,
         barcode_bars=_encode_bars(tracking, routing),
@@ -167,7 +156,7 @@ def render_envelope(
 
 
 # --------------------------------------------------------------------------- #
-# Avery 8163 rendering                                                        #
+# Avery rendering                                                             #
 # --------------------------------------------------------------------------- #
 
 
@@ -194,12 +183,14 @@ def _assign_positions(
     start_row: int,
     start_col: int,
     *,
+    cols: int,
+    rows: int,
     human_readable: bool,
 ) -> list[list[dict[str, object]]]:
     """Distribute ``items`` across sheet positions starting at (start_row, start_col).
 
     Returns a list of pages; each page is a list of label-dicts with
-    their (row, col) fixed. Row-major order within each page; overflow
+    their (row, col) fixed. Row-major within each page; overflow
     spills to additional pages starting at (1, 1).
     """
     pages: list[list[dict[str, object]]] = []
@@ -208,10 +199,10 @@ def _assign_positions(
     for item in items:
         current.append(_label_dict(item, row, col, human_readable=human_readable))
         col += 1
-        if col > _AVERY_COLS:
+        if col > cols:
             col = 1
             row += 1
-        if row > _AVERY_ROWS:
+        if row > rows:
             pages.append(current)
             current = []
             row, col = 1, 1
@@ -220,21 +211,23 @@ def _assign_positions(
     return pages
 
 
-def render_avery8163(
+def render_avery(
     labels_data: list[LabelData] | LabelData,
     out: BinaryIO,
     *,
+    part: str = DEFAULT_AVERY,
     mode: AveryMode = "fill",
     start_row: int = 1,
     start_col: int = 1,
     human_readable: bool = True,
 ) -> None:
-    """Render an Avery 8163 sheet of 4"x2" labels to ``out``.
+    """Render an Avery label sheet to ``out``.
 
     Args:
         labels_data: A single :class:`LabelData` (``mode="single"`` or
             ``"fill"``) or a list (``mode="batch"``).
         out: Binary sink for the rendered PDF bytes.
+        part: Key into :data:`mailwatch.avery.AVERY` (default ``"8163"``).
         mode: How to distribute ``labels_data`` across sheet positions.
 
             * ``"single"`` — exactly one label at
@@ -246,17 +239,19 @@ def render_avery8163(
             * ``"batch"`` — ``labels_data`` is a list of distinct
               labels, placed row-major starting at
               (``start_row``, ``start_col``), spilling to additional
-              pages if there are more than ``10 - skip`` entries.
-        start_row: 1-indexed row on page 1 (1..5).
-        start_col: 1-indexed column within that row (1..2).
+              pages if there are more than ``slots_per_sheet - skip``
+              entries.
+        start_row: 1-indexed row on page 1 (1..tpl.rows).
+        start_col: 1-indexed column within that row (1..tpl.cols).
         human_readable: If True (default), draw the 20-digit tracking
             + routing ZIP as text directly below the barcode on each
             label. Pass False to show bars only.
     """
-    if not 1 <= start_row <= _AVERY_ROWS:
-        raise ValueError(f"start_row must be 1..{_AVERY_ROWS}, got {start_row}")
-    if not 1 <= start_col <= _AVERY_COLS:
-        raise ValueError(f"start_col must be 1..{_AVERY_COLS}, got {start_col}")
+    tpl = AVERY[part]
+    if not 1 <= start_row <= tpl.rows:
+        raise ValueError(f"start_row must be 1..{tpl.rows}, got {start_row}")
+    if not 1 <= start_col <= tpl.cols:
+        raise ValueError(f"start_col must be 1..{tpl.cols}, got {start_col}")
 
     if mode == "batch":
         if not isinstance(labels_data, list):
@@ -274,10 +269,16 @@ def render_avery8163(
         if mode == "single":
             items = [single]
         else:  # "fill"
-            total_slots = _AVERY_COLS * _AVERY_ROWS
-            skip = (start_row - 1) * _AVERY_COLS + (start_col - 1)
-            items = [single] * max(0, total_slots - skip)
+            skip = (start_row - 1) * tpl.cols + (start_col - 1)
+            items = [single] * max(0, tpl.slots_per_sheet - skip)
 
-    pages = _assign_positions(items, start_row, start_col, human_readable=human_readable)
-    html_str = _jinja.get_template("avery8163.html").render(pages=pages)
+    pages = _assign_positions(
+        items,
+        start_row,
+        start_col,
+        cols=tpl.cols,
+        rows=tpl.rows,
+        human_readable=human_readable,
+    )
+    html_str = _jinja.get_template("avery.html").render(tpl=tpl, pages=pages)
     HTML(string=html_str, base_url=str(_templates_dir())).write_pdf(out)

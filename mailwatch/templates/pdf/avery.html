@@ -2,11 +2,11 @@
 <html>
 <head>
     <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
-    <title>Avery 8163 Shipping Labels</title>
+    <title>Avery {{ tpl.part }} labels</title>
 <style>
-/* WeasyPrint: @page replaces upstream's wkhtmltopdf CLI flags. */
+/* Page dims + per-label positioning come from mailwatch.avery.AVERY. */
 @page {
-    size: 8.5in 11in;
+    size: {{ tpl.page_w }}in {{ tpl.page_h }}in;
     margin: 0;
 }
 
@@ -26,16 +26,18 @@ body {
 }
 
 .page {
-    width: 8.5in;
-    height: 11in;
-    padding: 0.5in 0;
+    width: {{ tpl.page_w }}in;
+    height: {{ tpl.page_h }}in;
     page-break-after: always;
     position: relative;
 }
 
 .label {
-    width: 4in;
-    height: 2in;
+    width: {{ tpl.label_w }}in;
+    height: {{ tpl.label_h }}in;
+    max-width: {{ tpl.label_w }}in;
+    max-height: {{ tpl.label_h }}in;
+    overflow: hidden;
     position: absolute;
     padding: 0.1in;
 }
@@ -51,7 +53,7 @@ body {
 }
 
 .recipient-text {
-    font-family: "DejaVu Serif",serif;
+    font-family: "DejaVu Serif", serif;
 }
 
 </style>
@@ -60,7 +62,7 @@ body {
     {% for page in pages %}
     <div class="page">
         {% for label in page %}
-        <div class="label" style="top: {{ (label.row - 1) * 2 + 0.5 }}in; left: {{ (label.col - 1) * 4.25 + 0.2 }}in;">
+        <div class="label" style="top: {{ tpl.y0 + (label.row - 1) * tpl.dy }}in; left: {{ tpl.x0 + (label.col - 1) * tpl.dx }}in;">
             <div class="usps-barcode">{{ label.barcode_bars }}</div>
             {% if label.human_readable %}
             <div class="barcode-humanreadable">{{ label.human_readable_text }}</div>
