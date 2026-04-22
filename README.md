@@ -20,19 +20,44 @@ Self-hosted USPS Intelligent Mail barcode generator and letter tracker. Generate
 
 ## Quick start (development)
 
+The canonical dev workflow is nix-driven — `nix run .#dev` and `nix run .#test`
+set the WeasyPrint native-library path correctly for both linux
+(`LD_LIBRARY_PATH`) and darwin (`DYLD_FALLBACK_LIBRARY_PATH` — SIP strips
+`LD_LIBRARY_PATH` on macOS):
+
 ```sh
-uv sync --group dev
 cp .env.example .env
 # Fill in real values in .env
-uv run uvicorn mailwatch.app:app --reload
+nix run .#dev                         # uvicorn reload-server
+nix run .#test                        # pytest
+nix run .#dev -- --port 5000          # extra args pass through
+nix run .#test -- -k envelope -vv
+```
+
+If you prefer uv directly, `nix develop` drops you into a shell with
+`UV_PYTHON` + the library path pre-set, after which:
+
+```sh
+uv run uvicorn --factory mailwatch.app:create_app --reload
+uv run pytest
 ```
 
 Open http://127.0.0.1:8000 to generate an envelope.
 
 ## Running the test suite
 
+Canonical (matches CI):
+
 ```sh
-uv run pytest
+nix flake check -L                    # lint + typecheck + tests + nix hygiene
+nix build .#checks.$SYSTEM.tests      # just pytest, any $SYSTEM
+```
+
+Fast iteration:
+
+```sh
+nix run .#test                        # pytest with libs pre-wired
+uv run pytest                         # inside `nix develop`
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy mailwatch
@@ -59,7 +84,7 @@ Consume this flake as an input:
 
 ### Other deployments
 
-- Run `uv run gunicorn mailwatch.app:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 127.0.0.1:8082`
+- Run `uv run gunicorn 'mailwatch.app:create_app()' --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 127.0.0.1:8082` (factory syntax — the module exposes `create_app`, not a singleton `app`)
 - Front with a reverse proxy that terminates TLS and passes `X-Forwarded-For`
 - Gate most routes behind your auth layer; **exclude `/usps_feed`** — USPS must be able to POST to it by source IP only
 

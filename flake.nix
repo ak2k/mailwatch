@@ -60,6 +60,28 @@
           pkgs.fontconfig.lib
         ];
 
+      # Bash fragment that puts the WeasyPrint libs on the loader path for
+      # the host platform. On linux that's LD_LIBRARY_PATH; on darwin it's
+      # DYLD_FALLBACK_LIBRARY_PATH — SIP strips LD_LIBRARY_PATH and
+      # DYLD_LIBRARY_PATH from SIP-protected binaries, but leaves the
+      # FALLBACK variant intact. Same snippet drives the `tests` check,
+      # the devShell's shellHook, and the `dev` / `test` flake apps so
+      # WeasyPrint imports work the same way everywhere.
+      mkLibEnvSnippet =
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          libs = nixpkgs.lib.makeLibraryPath (weasyprintNativeLibs system);
+          var = if pkgs.stdenv.hostPlatform.isDarwin then "DYLD_FALLBACK_LIBRARY_PATH" else "LD_LIBRARY_PATH";
+        in
+        ''
+          if [ -n "''$${var}" ]; then
+            export ${var}="${libs}:''$${var}"
+          else
+            export ${var}="${libs}"
+          fi
+        '';
+
       mkPythonSet =
         system:
         let
@@ -94,25 +116,67 @@
         }
       );
 
+      apps = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          s = mkPythonSet system;
+          devEnv = s.pythonSet.mkVirtualEnv "mailwatch-env-dev" s.workspace.deps.all;
+          libEnv = mkLibEnvSnippet system;
+        in
+        {
+          # `nix run .#dev` — uvicorn reload-server with WeasyPrint libs on
+          # the loader path. `mailwatch.app:create_app` is a factory (not a
+          # module-level `app`); production uses gunicorn's factory syntax,
+          # and here we use uvicorn's `--factory` equivalent so dev + prod
+          # share one entrypoint shape. Passes extra args to uvicorn:
+          #   nix run .#dev -- --host 0.0.0.0 --port 5000
+          dev = {
+            type = "app";
+            program = toString (
+              pkgs.writeShellScript "mailwatch-dev" ''
+                ${libEnv}
+                exec ${devEnv}/bin/uvicorn --factory mailwatch.app:create_app --reload "$@"
+              ''
+            );
+            meta.description = "Run the mailwatch dev server (uvicorn --reload) with WeasyPrint libs on the path";
+          };
+          # `nix run .#test` — pytest with WeasyPrint libs on the path.
+          # Accepts extra pytest args: `nix run .#test -- -k envelope -vv`.
+          test = {
+            type = "app";
+            program = toString (
+              pkgs.writeShellScript "mailwatch-test" ''
+                ${libEnv}
+                exec ${devEnv}/bin/pytest "$@"
+              ''
+            );
+            meta.description = "Run mailwatch's pytest suite with WeasyPrint libs on the path";
+          };
+        }
+      );
+
       checks = forAllSystems (
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
           s = mkPythonSet system;
           devEnv = s.pythonSet.mkVirtualEnv "mailwatch-env-dev" s.workspace.deps.all;
+          libEnv = mkLibEnvSnippet system;
         in
         {
           # Python tooling caches must point at the sandbox-writable $TMPDIR;
           # the source tree `cd`-d into is a read-only /nix/store path.
-          # LD_LIBRARY_PATH carries WeasyPrint's dlopen targets so
-          # `import mailwatch.pdf` works under test — same plumbing
-          # the nixosModule does for runtime services.
+          # libEnv exports the platform-appropriate loader-path env var so
+          # `import mailwatch.pdf` works under test on both linux and
+          # darwin — same plumbing the nixosModule does for runtime
+          # services.
           tests = pkgs.runCommand "mailwatch-tests" { nativeBuildInputs = [ devEnv ]; } ''
             cp -r ${./.}/. .
             chmod -R u+w .
             export HOME=$TMPDIR
             export PYTEST_CACHE_DIR=$TMPDIR/.pytest_cache
-            export LD_LIBRARY_PATH=${nixpkgs.lib.makeLibraryPath (weasyprintNativeLibs system)}
+            ${libEnv}
             pytest
             touch $out
           '';
@@ -152,6 +216,7 @@
           pkgs = nixpkgs.legacyPackages.${system};
           s = mkPythonSet system;
           devEnv = s.pythonSet.mkVirtualEnv "mailwatch-env-dev" s.workspace.deps.all;
+          libEnv = mkLibEnvSnippet system;
         in
         {
           default = pkgs.mkShell {
@@ -162,6 +227,7 @@
             shellHook = ''
               export UV_NO_SYNC=1
               export UV_PYTHON="${devEnv}/bin/python"
+              ${libEnv}
             '';
           };
         }
