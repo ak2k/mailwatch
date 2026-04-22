@@ -16,8 +16,8 @@ later if needed — intentionally absent here to keep the suite fast.
 from __future__ import annotations
 
 import io
-import re
 
+import pypdf
 import pytest
 
 from mailwatch.pdf import LabelData, render_avery8163, render_envelope
@@ -59,12 +59,14 @@ def _assert_valid_pdf(blob: bytes) -> None:
 
 
 def _page_count(blob: bytes) -> int:
-    """Count ``/Type /Page`` objects — good enough for our tests.
+    """Return the number of pages in a PDF blob.
 
-    WeasyPrint emits ``/Pages`` (the tree node) plus one ``/Page`` per
-    page. The negative lookahead excludes the tree node.
+    Parses the object tree via ``pypdf`` rather than regexing for
+    ``/Type /Page``; WeasyPrint compresses object streams so the
+    literal marker doesn't appear in the raw bytes.
     """
-    return len(re.findall(rb"/Type\s*/Page(?!s)", blob))
+    reader = pypdf.PdfReader(io.BytesIO(blob))
+    return len(reader.pages)
 
 
 # --------------------------------------------------------------------------- #

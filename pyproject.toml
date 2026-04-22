@@ -49,6 +49,10 @@ dev = [
     # runtime uses WeasyPrint + USPSIMBStandard font for bar rendering,
     # not reportlab.
     "reportlab>=4.2,<5",
+    # pypdf is dev-only: tests assert page counts on WeasyPrint output,
+    # which is compressed so regex-based counting misses. pypdf reads
+    # the object tree directly.
+    "pypdf>=5.0,<7",
 ]
 
 [build-system]
