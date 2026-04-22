@@ -18,6 +18,11 @@
   lib,
   pkgs,
   mailwatchPackage,
+  # Native libraries WeasyPrint dlopens at import time via cffi
+  # (pango, cairo, glib, harfbuzz, fontconfig). The flake passes these
+  # as store paths; the module wires them into each service's
+  # LD_LIBRARY_PATH so the wheel's cffi.dlopen calls can resolve.
+  weasyprintLibs ? [ ],
 }:
 
 let
@@ -28,11 +33,16 @@ let
     types
     literalExpression
     concatStringsSep
+    makeLibraryPath
     ;
 
   cfg = config.services.mailwatch;
 
   dbPath = "${cfg.stateDir}/mailwatch.db";
+
+  # Colon-separated list of .so paths — empty when no libs provided.
+  # (Consumers can pass a non-default weasyprintLibs to override.)
+  ldLibraryPath = makeLibraryPath weasyprintLibs;
 
   # Shared systemd hardening bundle. Applied to every mailwatch service
   # (app, poll, cleanup). Based on the nixpkgs lego/acme Go-service
@@ -208,6 +218,7 @@ in
           wantedBy = [ "multi-user.target" ];
           environment = {
             DB_PATH = dbPath;
+            LD_LIBRARY_PATH = ldLibraryPath;
           };
           serviceConfig = hardening // {
             Type = "notify";
@@ -254,6 +265,7 @@ in
           environment = {
             DB_PATH = dbPath;
             POLL_LOOKBACK_DAYS = toString cfg.poll.lookbackDays;
+            LD_LIBRARY_PATH = ldLibraryPath;
           };
           serviceConfig = hardening // {
             Type = "oneshot";
@@ -273,6 +285,7 @@ in
           description = "mailwatch — prune old scan events and expired sessions";
           environment = {
             DB_PATH = dbPath;
+            LD_LIBRARY_PATH = ldLibraryPath;
           };
           serviceConfig = hardening // {
             Type = "oneshot";
