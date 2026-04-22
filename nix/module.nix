@@ -233,7 +233,10 @@ in
               "--timeout 60"
               "--access-logfile -"
               "--error-logfile -"
-              "mailwatch.app:app"
+              # Factory syntax: gunicorn calls `create_app()` once per worker
+              # after import. Avoids eager module-level app creation that
+              # would force env-var validation at pytest collection time.
+              "mailwatch.app:create_app()"
             ];
             ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
             Restart = "on-failure";
