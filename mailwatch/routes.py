@@ -124,6 +124,12 @@ class GenerateForm(BaseModel):
     format_type: Literal["envelope", "avery"] = "envelope"
     row: int = Field(1, ge=1, le=5)
     col: int = Field(1, ge=1, le=2)
+    # Avery-only: "single" prints one label at (row, col), "fill" (default)
+    # repeats the recipient into every remaining slot on the sheet.
+    avery_mode: Literal["single", "fill"] = "fill"
+    # Human-readable digit line directly below the barcode bars.
+    # Defaults on; pass false to render bars only.
+    human_readable: bool = True
 
 
 class TrackWSRequest(BaseModel):
@@ -219,6 +225,12 @@ async def post_generate(
     format_type: Annotated[Literal["envelope", "avery"], Form()] = "envelope",
     row: Annotated[int, Form()] = 1,
     col: Annotated[int, Form()] = 1,
+    avery_mode: Annotated[Literal["single", "fill"], Form()] = "fill",
+    # HTML checkboxes only transmit when checked. The form's checkbox
+    # is pre-checked on page load, so a submit with no user interaction
+    # arrives as `human_readable=true` → True. If the user explicitly
+    # unchecks it, the field is absent and we default to False.
+    human_readable: Annotated[bool, Form()] = False,
     settings: Settings = Depends(get_settings_dep),
     locked: tuple[sqlite3.Connection, asyncio.Lock] = Depends(get_db_locked),
 ) -> Response:
@@ -240,6 +252,8 @@ async def post_generate(
             format_type=format_type,
             row=row,
             col=col,
+            avery_mode=avery_mode,
+            human_readable=human_readable,
         )
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
@@ -277,6 +291,8 @@ async def post_generate(
     request.session["format_type"] = form.format_type
     request.session["row"] = form.row
     request.session["col"] = form.col
+    request.session["avery_mode"] = form.avery_mode
+    request.session["human_readable"] = form.human_readable
 
     pdf_url = f"/download/{form.format_type}/pdf"
     tracking_url = f"/tracking?serial={serial}&zip={form.recipient_zip}"
@@ -329,10 +345,11 @@ async def get_download(
             },
         )
 
-    # doc_type == "pdf" — render via reportlab; the generator is sync so
-    # dispatch to a worker thread.
+    # doc_type == "pdf" — render via WeasyPrint. The renderers are sync,
+    # so dispatch to a worker thread.
     sender_lines_val = _sender_lines(sender_address)
     recipient_lines_val = _recipient_lines_from_session(recipient)
+    human_readable = bool(request.session.get("human_readable", True))
 
     buf = io.BytesIO()
     if format_type == "envelope":
@@ -343,6 +360,7 @@ async def get_download(
             tracking,
             routing,
             buf,
+            human_readable=human_readable,
         )
         filename = f"envelope-{serial}.pdf"
     else:
@@ -353,12 +371,15 @@ async def get_download(
         }
         start_row = request.session.get("row", 1)
         start_col = request.session.get("col", 1)
+        avery_mode: pdf.AveryMode = request.session.get("avery_mode", "fill")
         await asyncio.to_thread(
             pdf.render_avery8163,
-            [label],
+            label,
             buf,
+            mode=avery_mode,
             start_row=start_row,
             start_col=start_col,
+            human_readable=human_readable,
         )
         filename = f"avery-{serial}.pdf"
 

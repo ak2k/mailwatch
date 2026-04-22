@@ -62,7 +62,9 @@ body {
         {% for label in page %}
         <div class="label" style="top: {{ (label.row - 1) * 2 + 0.5 }}in; left: {{ (label.col - 1) * 4.25 + 0.2 }}in;">
             <div class="usps-barcode">{{ label.barcode_bars }}</div>
-            <div class="barcode-humanreadable">{{ label.human_readable }}</div>
+            {% if label.human_readable %}
+            <div class="barcode-humanreadable">{{ label.human_readable_text }}</div>
+            {% endif %}
             <div class="recipient-text">
                 {% for line in label.recipient_lines %}{{ line }}<br/>
                 {% endfor %}

@@ -145,19 +145,23 @@ def render_envelope(
 
     * Sender block: top-left, DejaVu Serif 10pt-ish, plain text lines.
     * Recipient block: bottom-right, flex column — barcode bars on
-      top, human-readable digits below, recipient address lines below
-      that. Automatic vertical centering inside a 4"x2.5" box anchored
-      at ``left: 5in; bottom: 0.625in``.
+      top, the optional human-readable digit line below the bars, and
+      the recipient address lines below that. Automatic vertical
+      centering inside a 4"x2.5" box anchored at
+      ``left: 5in; bottom: 0.625in``.
 
-    ``human_readable`` is accepted for API compatibility but ignored —
-    the human-readable line is always rendered (consistent with
-    upstream + USPS recommendations).
+    Args:
+        human_readable: If True (default), draw the 20-digit tracking
+            + routing ZIP as 6pt text directly below the barcode bars.
+            USPS doesn't require the human-readable line — pass False
+            to omit it.
     """
     html_str = _jinja.get_template("envelope.html").render(
         sender_lines=sender,
         recipient_lines=recipient,
         barcode_bars=_encode_bars(tracking, routing),
-        human_readable=_human_readable(tracking, routing),
+        human_readable=human_readable,
+        human_readable_text=_human_readable(tracking, routing),
     )
     HTML(string=html_str, base_url=str(_templates_dir())).write_pdf(out)
 
@@ -167,13 +171,20 @@ def render_envelope(
 # --------------------------------------------------------------------------- #
 
 
-def _label_dict(label: LabelData, row: int, col: int) -> dict[str, object]:
+def _label_dict(
+    label: LabelData,
+    row: int,
+    col: int,
+    *,
+    human_readable: bool,
+) -> dict[str, object]:
     """Build a template-renderable dict for one label at (row, col)."""
     return {
         "row": row,
         "col": col,
         "barcode_bars": _encode_bars(label["tracking"], label["routing"]),
-        "human_readable": _human_readable(label["tracking"], label["routing"]),
+        "human_readable": human_readable,
+        "human_readable_text": _human_readable(label["tracking"], label["routing"]),
         "recipient_lines": label["recipient"],
     }
 
@@ -182,6 +193,8 @@ def _assign_positions(
     items: list[LabelData],
     start_row: int,
     start_col: int,
+    *,
+    human_readable: bool,
 ) -> list[list[dict[str, object]]]:
     """Distribute ``items`` across sheet positions starting at (start_row, start_col).
 
@@ -193,7 +206,7 @@ def _assign_positions(
     current: list[dict[str, object]] = []
     row, col = start_row, start_col
     for item in items:
-        current.append(_label_dict(item, row, col))
+        current.append(_label_dict(item, row, col, human_readable=human_readable))
         col += 1
         if col > _AVERY_COLS:
             col = 1
@@ -214,6 +227,7 @@ def render_avery8163(
     mode: AveryMode = "fill",
     start_row: int = 1,
     start_col: int = 1,
+    human_readable: bool = True,
 ) -> None:
     """Render an Avery 8163 sheet of 4"x2" labels to ``out``.
 
@@ -235,6 +249,9 @@ def render_avery8163(
               pages if there are more than ``10 - skip`` entries.
         start_row: 1-indexed row on page 1 (1..5).
         start_col: 1-indexed column within that row (1..2).
+        human_readable: If True (default), draw the 20-digit tracking
+            + routing ZIP as text directly below the barcode on each
+            label. Pass False to show bars only.
     """
     if not 1 <= start_row <= _AVERY_ROWS:
         raise ValueError(f"start_row must be 1..{_AVERY_ROWS}, got {start_row}")
@@ -261,6 +278,6 @@ def render_avery8163(
             skip = (start_row - 1) * _AVERY_COLS + (start_col - 1)
             items = [single] * max(0, total_slots - skip)
 
-    pages = _assign_positions(items, start_row, start_col)
+    pages = _assign_positions(items, start_row, start_col, human_readable=human_readable)
     html_str = _jinja.get_template("avery8163.html").render(pages=pages)
     HTML(string=html_str, base_url=str(_templates_dir())).write_pdf(out)

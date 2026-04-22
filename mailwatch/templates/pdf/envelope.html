@@ -81,7 +81,9 @@ body {
 		</div>
 		<div class="recipient-address">
 			<div class="usps-barcode">{{ barcode_bars }}</div>
-			<div class="barcode-humanreadable">{{ human_readable }}</div>
+			{% if human_readable %}
+			<div class="barcode-humanreadable">{{ human_readable_text }}</div>
+			{% endif %}
 			<div class="recipient-text">
 				{% for line in recipient_lines %}{{ line }}<br/>
 				{% endfor %}
