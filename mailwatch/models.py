@@ -37,8 +37,15 @@ class NewApiTokenResponse(BaseModel):
 
     USPS docs name the required fields ``access_token``, ``token_type``,
     ``expires_in``, and optionally ``scope`` / ``issued_at``. We keep the
-    optional ones as ``str | None`` so callers that want them can read them,
-    but the happy path only needs the first three.
+    optional ones around so callers that want them can read them, but the
+    happy path only needs the first three.
+
+    Empirically (verified against a live apis.usps.com Public Access app,
+    2026-04): ``issued_at`` comes back as an **integer** unix-milliseconds
+    timestamp, not a string — USPS's own docs disagree with the deployed
+    API. ``api_products`` comes back as a **list** of strings, not a single
+    string. Typing both permissively so the model doesn't reject real
+    responses.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -47,22 +54,25 @@ class NewApiTokenResponse(BaseModel):
     token_type: str = "Bearer"
     expires_in: int
     scope: str | None = None
-    issued_at: str | None = None
+    issued_at: int | str | None = None
     application_name: str | None = None
-    api_products: str | None = None
+    api_products: list[str] | str | None = None
 
 
 class IVMTRTokenResponse(BaseModel):
     """Response from ``POST services.usps.com/oauth/authenticate`` (IV-MTR).
 
-    Legacy OAuth flow: unlike the modern apis.usps.com endpoint this one also
-    returns a refresh_token.
+    Legacy OAuth flow — spec says it returns a refresh_token alongside the
+    access_token, but empirically (verified 2026-04) not every response
+    carries one. Treat as optional so the model tolerates both shapes; the
+    client re-authenticates with username+password if the refresh_token is
+    absent on renewal.
     """
 
     model_config = ConfigDict(extra="ignore")
 
     access_token: str
-    refresh_token: str
+    refresh_token: str | None = None
     token_type: str
     expires_in: int
 
