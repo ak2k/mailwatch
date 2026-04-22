@@ -109,7 +109,8 @@ def test_index_renders(client: TestClient) -> None:
     body = resp.text
     assert '<form id="generate-form"' in body
     assert 'name="sender_address"' in body
-    assert 'name="format_type"' in body
+    # Format choice lives on /preview now, not page 1.
+    assert 'name="format_type"' not in body
 
 
 def test_index_prefills_sender_from_session(client: TestClient) -> None:
@@ -136,7 +137,6 @@ def _valid_form(**overrides: Any) -> dict[str, Any]:
         "recipient_city": "Washington",
         "recipient_state": "DC",
         "recipient_zip": "20500",
-        "format_type": "envelope",
     }
     base.update({k: str(v) for k, v in overrides.items()})
     return base
@@ -150,20 +150,14 @@ def _submit_generate(client: TestClient, **overrides: Any) -> Any:
 
 
 def test_generate_redirects_to_preview(client: TestClient) -> None:
-    """POST /generate returns 303 → /preview?fmt=<format> (no HTML body)."""
+    """POST /generate returns 303 → /preview (no HTML body).
+
+    Format choice happens on /preview, so /generate doesn't need to carry
+    a fmt query param through — /preview defaults to fmt=envelope.
+    """
     resp = client.post("/generate", data=_valid_form(), follow_redirects=False)
     assert resp.status_code == 303
-    assert resp.headers["location"] == "/preview?fmt=envelope"
-
-
-def test_generate_avery_redirects_to_avery_preview(client: TestClient) -> None:
-    resp = client.post(
-        "/generate",
-        data=_valid_form(format_type="avery"),
-        follow_redirects=False,
-    )
-    assert resp.status_code == 303
-    assert resp.headers["location"] == "/preview?fmt=avery"
+    assert resp.headers["location"] == "/preview"
 
 
 def test_generate_happy_path_preview_has_embed(client: TestClient) -> None:
@@ -238,7 +232,7 @@ def test_download_pdf_envelope_different_size(client: TestClient) -> None:
 
 def test_preview_clamps_stale_row_col_into_chosen_grid(client: TestClient) -> None:
     """A URL built against 5167 (4x20) must not 500 when switched to 8163 (2x5)."""
-    _submit_generate(client, format_type="avery")
+    _submit_generate(client)
     resp = client.get(
         "/preview",
         params={"fmt": "avery", "part": "8163", "row": 999, "col": 999},
@@ -250,7 +244,7 @@ def test_preview_clamps_stale_row_col_into_chosen_grid(client: TestClient) -> No
 
 
 def test_download_pdf_clamps_stale_row_col(client: TestClient) -> None:
-    _submit_generate(client, format_type="avery")
+    _submit_generate(client)
     resp = client.get(
         "/download/pdf",
         params={"fmt": "avery", "part": "8163", "row": 999, "col": 999},
@@ -260,7 +254,7 @@ def test_download_pdf_clamps_stale_row_col(client: TestClient) -> None:
 
 
 def test_download_pdf_avery(client: TestClient) -> None:
-    _submit_generate(client, format_type="avery")
+    _submit_generate(client)
     resp = client.get(
         "/download/pdf",
         params={"fmt": "avery", "part": "8163", "mode": "fill", "row": 2, "col": 1},
@@ -270,7 +264,7 @@ def test_download_pdf_avery(client: TestClient) -> None:
 
 
 def test_download_pdf_avery_other_part(client: TestClient) -> None:
-    _submit_generate(client, format_type="avery")
+    _submit_generate(client)
     resp = client.get(
         "/download/pdf",
         params={"fmt": "avery", "part": "5160", "mode": "fill"},

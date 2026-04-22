@@ -101,7 +101,9 @@ body {
             {% for line in sender_lines %}{{ line }}<br/>{% endfor %}
         </div>
         <div class="recipient">
-            {% for line in recipient_lines %}{{ line }}<br/>{% endfor %}
+            <div class="recipient-lines">
+                {% for line in recipient_lines %}{{ line }}<br/>{% endfor %}
+            </div>
         </div>
         <div class="barcode">
             {% if human_readable %}<div class="hr-digits">{{ human_readable_text }}</div>{% endif %}

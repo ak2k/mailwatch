@@ -5,9 +5,9 @@
 {% block content %}
 <h1>Generate a tracked envelope</h1>
 <p>
-  Fill in sender and recipient addresses, pick a format, and you'll land
-  on a preview page where you can change the envelope size, label part,
-  or other output options without re-entering anything.
+  Fill in sender and recipient addresses and you'll land on a preview
+  page where you can pick envelope size, Avery label part, or other
+  output options without re-entering anything.
 </p>
 
 <form id="generate-form" action="/generate" method="post" class="stack">
@@ -83,20 +83,6 @@
     <div class="field">
       <button type="button" id="validate-btn">Validate address</button>
       <div id="validate-result" class="validate-result" hidden></div>
-    </div>
-  </fieldset>
-
-  <fieldset>
-    <legend>Output format</legend>
-    <div class="field radios">
-      <label class="radio">
-        <input type="radio" name="format_type" value="envelope" checked>
-        Envelope — pick a size on the next page
-      </label>
-      <label class="radio">
-        <input type="radio" name="format_type" value="avery">
-        Avery label sheet — pick a part on the next page
-      </label>
     </div>
   </fieldset>
 

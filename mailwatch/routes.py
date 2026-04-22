@@ -141,7 +141,6 @@ class GenerateForm(BaseModel):
     recipient_city: str = Field(..., min_length=1, max_length=_MAX_FIELD_LEN)
     recipient_state: str = Field(..., min_length=2, max_length=2, pattern=r"^[A-Za-z]{2}$")
     recipient_zip: str = Field(..., pattern=_ZIP_PATTERN)
-    format_type: Literal["envelope", "avery"] = "envelope"
 
 
 class TrackWSRequest(BaseModel):
@@ -261,7 +260,6 @@ async def post_generate(
     recipient_zip: Annotated[str, Form()],
     recipient_company: Annotated[str | None, Form()] = None,
     recipient_address2: Annotated[str | None, Form()] = None,
-    format_type: Annotated[Literal["envelope", "avery"], Form()] = "envelope",
     settings: Settings = Depends(get_settings_dep),
     locked: tuple[sqlite3.Connection, asyncio.Lock] = Depends(get_db_locked),
 ) -> Response:
@@ -283,7 +281,6 @@ async def post_generate(
             recipient_city=recipient_city,
             recipient_state=recipient_state.upper(),
             recipient_zip=recipient_zip,
-            format_type=format_type,
         )
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
@@ -320,9 +317,11 @@ async def post_generate(
     request.session["routing"] = routing
 
     # 303 = "see other" — turns the POST into a GET for the redirect target,
-    # so refreshing the preview page doesn't resubmit the form.
+    # so refreshing the preview page doesn't resubmit the form. The preview
+    # page lets the user pick envelope vs Avery via its own format radio,
+    # so /generate doesn't need to carry a format choice through.
     return RedirectResponse(
-        url=f"/preview?fmt={form.format_type}",
+        url="/preview",
         status_code=303,
     )
 
