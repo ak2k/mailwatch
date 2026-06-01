@@ -532,3 +532,109 @@ async def test_iv_get_tracking_parses_response(
     assert result.data.imb == imb
     assert len(result.data.scans) == 1
     assert result.data.scans[0].scanEventCode == "SD"
+
+
+async def test_iv_refresh_without_refresh_token_keeps_existing(
+    conn: sqlite3.Connection,
+    config: Settings,
+) -> None:
+    """A renewal response that omits ``refresh_token`` must not crash or wipe it.
+
+    USPS returns a fresh ``access_token`` but no ``refresh_token`` on renewal.
+    ``app_state.value`` is NOT NULL, so persisting a missing refresh token used
+    to raise ``IntegrityError`` and abort renewal. The existing refresh token
+    must survive untouched.
+    """
+    db.set_state(conn, "iv_access_token", "expired")
+    db.set_state(conn, "iv_refresh_token", "keep-me")
+    db.set_state(conn, "iv_token_expiry", "0")
+
+    renewal_no_refresh = {
+        "access_token": "fresh-access",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }
+    recorder = CallRecorder()
+    recorder.add("POST", IV_TOKEN_URL, [httpx.Response(200, json=renewal_no_refresh)])
+
+    async with _make_client(recorder) as http:
+        client = IVMTRClient(config, conn, http)
+        token = await client.get_access_token()
+
+    assert token == "fresh-access"
+    assert db.get_state(conn, "iv_access_token") == b"fresh-access"
+    # The pre-existing refresh token is preserved, not nulled.
+    assert db.get_state(conn, "iv_refresh_token") == b"keep-me"
+
+
+async def test_iv_get_tracking_parses_live_snake_case_schema(
+    conn: sqlite3.Connection,
+    config: Settings,
+    iv_token_body: dict[str, object],
+) -> None:
+    """The live IV-MTR pull API returns snake_case keys with no per-scan imb.
+
+    Regression fence for the model alias fix — a camelCase-only model raised 15
+    validation errors on this exact shape, silently dropping every real scan.
+    """
+    imb = "9" * 31
+    live_body = {
+        "message": None,
+        "data": {
+            "piece_id": "abc-123",
+            "mail_class": "First Class",
+            "expected_delivery_date": "2026-06-01",
+            "imb": imb,
+            "scans": [
+                {
+                    "scan_date_time": "2026-05-30T02:02:04",
+                    "scan_event_code": "919",
+                    "scan_facility_city": "NEW YORK",
+                    "scan_facility_state": "NY",
+                    "scan_facility_zip": "10199",
+                    "mail_phase": "Phase 3c- Destination Sequenced Carrier Sortation",
+                    "handling_event_type": "A",
+                    "machine_name": "DBCS-051",
+                }
+            ],
+        },
+    }
+    recorder = CallRecorder()
+    recorder.add("POST", IV_AUTH_URL, [httpx.Response(200, json=iv_token_body)])
+    recorder.add("GET", IV_TRACKING_URL, [httpx.Response(200, json=live_body)])
+
+    async with _make_client(recorder) as http:
+        client = IVMTRClient(config, conn, http)
+        result = await client.get_tracking(imb)
+
+    assert result.error is None
+    assert result.data is not None
+    assert result.data.imb == imb
+    assert result.data.expected_delivery_date == "2026-06-01"
+    assert len(result.data.scans) == 1
+    scan = result.data.scans[0]
+    assert scan.scanEventCode == "919"
+    assert scan.scanFacilityCity == "NEW YORK"
+    assert scan.scanDatetime.isoformat() == "2026-05-30T02:02:04"
+
+
+async def test_iv_get_tracking_barcode_not_found_maps_to_error(
+    conn: sqlite3.Connection,
+    config: Settings,
+    iv_token_body: dict[str, object],
+) -> None:
+    """``{"message": "Barcode not found.", "data": null}`` → error set, data None."""
+    recorder = CallRecorder()
+    recorder.add("POST", IV_AUTH_URL, [httpx.Response(200, json=iv_token_body)])
+    recorder.add(
+        "GET",
+        IV_TRACKING_URL,
+        [httpx.Response(200, json={"message": "Barcode not found.", "data": None})],
+    )
+
+    async with _make_client(recorder) as http:
+        client = IVMTRClient(config, conn, http)
+        result = await client.get_tracking("9" * 31)
+
+    assert result.data is None
+    assert result.error == "Barcode not found."

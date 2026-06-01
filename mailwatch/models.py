@@ -179,40 +179,58 @@ class StandardizedAddressResponse(BaseModel):
 
 
 class TrackingScan(BaseModel):
-    """One scan event from the IV-MTR tracking endpoint."""
+    """One scan event from the IV-MTR tracking endpoint.
 
-    model_config = ConfigDict(extra="ignore")
+    The live IV-MTR pull API returns snake_case keys (``scan_date_time``,
+    ``scan_event_code``, ``scan_facility_*``) and carries **no** per-scan
+    ``imb`` — the piece IMb appears once at the ``data`` level. Field aliases
+    map those wire names onto stable camelCase attribute names, and
+    ``populate_by_name`` keeps construction-by-field-name (tests, internal
+    code) and ``model_dump_json()`` round-tripping working. ``model_dump_json``
+    emits field names, so stored ``event_json`` blobs use the camelCase keys
+    that the merge/delivery-gating code reads.
+    """
 
-    imb: str
-    scanDatetime: datetime
-    scanEventCode: str
-    scanFacilityCity: str | None = None
-    scanFacilityState: str | None = None
-    scanFacilityZip: str | None = None
-    machineName: str | None = None
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    scanDatetime: datetime = Field(alias="scan_date_time")
+    scanEventCode: str = Field(alias="scan_event_code")
+    scanFacilityCity: str | None = Field(default=None, alias="scan_facility_city")
+    scanFacilityState: str | None = Field(default=None, alias="scan_facility_state")
+    scanFacilityZip: str | None = Field(default=None, alias="scan_facility_zip")
+    machineName: str | None = Field(default=None, alias="machine_name")
+    mailPhase: str | None = Field(default=None, alias="mail_phase")
+    handlingEventType: str | None = Field(default=None, alias="handling_event_type")
 
 
 class TrackingData(BaseModel):
-    """The ``data`` payload on success."""
+    """The ``data`` payload on success.
+
+    Carries the piece-level ``imb`` plus the scan list; the many other
+    IV-MTR fields (``piece_id``, ``mail_class``, …) are ignored except
+    ``expected_delivery_date``, surfaced for ETA display.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
     imb: str
     scans: list[TrackingScan] = Field(default_factory=list)
+    expected_delivery_date: str | None = None
 
 
 class TrackingResponse(BaseModel):
     """Wrapper returned by the tracking endpoint.
 
-    On success ``data`` is populated; on error ``error`` holds a message.
-    Both can technically be present (USPS occasionally returns partial
-    results with a warning), so we don't mark them mutually exclusive.
+    On success ``data`` is populated and the wire field ``message`` is null.
+    On a miss IV-MTR returns ``{"message": "Barcode not found.", "data": null}``
+    — ``message`` is aliased onto ``error`` so callers can distinguish "not
+    found / error" from a genuinely empty result.
     """
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     data: TrackingData | None = None
-    error: str | None = None
+    error: str | None = Field(default=None, alias="message")
 
 
 # --------------------------------------------------------------------------- #
@@ -226,6 +244,14 @@ class PushFeedEvent(BaseModel):
     ``handlingEventType`` filtering (we only care about ``"L"`` — letter
     scans — for mailwatch) happens in the route handler, not here. The model
     accepts all event types so we can log the raw push and analyse it later.
+
+    UNVERIFIED AGAINST LIVE DATA: these field names predate any real push
+    delivery. The IV-MTR *pull* API was found to return snake_case keys
+    (``scan_date_time`` etc.) and ``handling_event_type`` values like ``"A"``
+    rather than ``"L"`` — see :class:`TrackingScan`. The push feed likely
+    shares that convention, so this model (and the ``handlingEventType == "L"``
+    filter in ``routes.post_usps_feed``) should be re-checked against the
+    first real captured webhook payload before relying on the push path.
     """
 
     model_config = ConfigDict(extra="ignore")

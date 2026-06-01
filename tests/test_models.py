@@ -256,10 +256,47 @@ class TestTrackingResponse:
         assert td.scans == []
 
     def test_scan_rejects_missing_required(self) -> None:
+        # scanDatetime + scanEventCode are the only required fields; a payload
+        # missing the event code must raise (per-scan imb is not required —
+        # the live IV-MTR pull API doesn't send one).
         with pytest.raises(ValidationError):
-            TrackingScan.model_validate(
-                {"scanDatetime": "2026-04-20T00:00:00Z", "scanEventCode": "SPM"}
-            )
+            TrackingScan.model_validate({"scan_date_time": "2026-04-20T00:00:00Z"})
+
+    def test_parses_live_snake_case_payload(self) -> None:
+        # The exact shape the live IV-MTR pull API returns: snake_case keys,
+        # no per-scan imb, message-not-error wrapper.
+        resp = TrackingResponse.model_validate(
+            {
+                "message": None,
+                "data": {
+                    "imb": "9" * 31,
+                    "expected_delivery_date": "2026-06-01",
+                    "scans": [
+                        {
+                            "scan_date_time": "2026-05-30T02:02:04",
+                            "scan_event_code": "919",
+                            "scan_facility_city": "NEW YORK",
+                            "scan_facility_state": "NY",
+                            "scan_facility_zip": "10199",
+                            "handling_event_type": "A",
+                            "machine_name": "DBCS-051",
+                        }
+                    ],
+                },
+            }
+        )
+        assert resp.error is None
+        assert resp.data is not None
+        assert resp.data.expected_delivery_date == "2026-06-01"
+        scan = resp.data.scans[0]
+        assert scan.scanEventCode == "919"
+        assert scan.scanFacilityCity == "NEW YORK"
+        assert scan.scanDatetime == datetime(2026, 5, 30, 2, 2, 4)
+
+    def test_barcode_not_found_message_maps_to_error(self) -> None:
+        resp = TrackingResponse.model_validate({"message": "Barcode not found.", "data": None})
+        assert resp.data is None
+        assert resp.error == "Barcode not found."
 
 
 # --------------------------------------------------------------------------- #

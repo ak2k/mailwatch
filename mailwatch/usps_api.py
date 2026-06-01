@@ -286,13 +286,22 @@ class IVMTRClient:
         )
 
     async def _store_tokens(self, parsed: IVMTRTokenResponse) -> None:
-        """Persist a freshly issued IV-MTR token trio."""
+        """Persist a freshly issued IV-MTR access token (and refresh, if any).
+
+        USPS omits ``refresh_token`` on a renewal response (only the initial
+        BSG authenticate returns one). ``app_state.value`` is ``NOT NULL``, so
+        writing a missing refresh token raised ``sqlite3.IntegrityError`` and
+        aborted the whole renewal. We therefore only overwrite the stored
+        refresh token when the response actually carries one — the existing
+        refresh token stays valid for the next renewal.
+        """
         lifetime = max(1, int(parsed.expires_in))
         expiry = time.time() + (lifetime / 2.0)
         await _run_db(self._db_lock, db.set_state, self._db, "iv_access_token", parsed.access_token)
-        await _run_db(
-            self._db_lock, db.set_state, self._db, "iv_refresh_token", parsed.refresh_token
-        )
+        if parsed.refresh_token:
+            await _run_db(
+                self._db_lock, db.set_state, self._db, "iv_refresh_token", parsed.refresh_token
+            )
         await _run_db(self._db_lock, db.set_state, self._db, "iv_token_expiry", f"{expiry:.3f}")
 
     async def _maybe_rate_limit(self) -> None:

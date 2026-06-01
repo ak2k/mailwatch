@@ -64,7 +64,7 @@ async def _poll_once(
     conn = db.connect(settings.DB_PATH)
     db.init_db(conn)
     try:
-        in_flight = db.get_in_flight_imbs(conn, lookback_days=lookback_days)
+        in_flight = db.get_pollable_imbs(conn, lookback_days=lookback_days)
         if not in_flight:
             return {"polled": 0, "new_events": 0, "errors": 0}
 

@@ -4,10 +4,12 @@ Run via ``python -m mailwatch.cleanup`` from a systemd timer (or cron).
 Purges:
 
 * ``scan_events`` older than 60 days — telemetry, not truth data.
-* ``serial_counters`` older than 48 hours — only the current day's row
-  is load-bearing; stale days can be reclaimed.
 * ``address_cache`` older than 1 year — USPS delivery-point data does
   drift, so let entries re-standardize annually.
+
+Never purges ``serial_state`` (the global monotonic serial counter must
+climb forever to keep IMbs unique) or ``tracked_imbs`` (one tiny row per
+letter, feeds long-tail tracking lookups).
 
 Does *not* run ``VACUUM`` (rewrites the DB file and invalidates the
 Litestream generation) or ``PRAGMA wal_checkpoint`` (races with

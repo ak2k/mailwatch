@@ -31,7 +31,7 @@ def test_cleanup_returns_delete_counts(_settings_env: Path) -> None:
     """Running ``cleanup.main`` on a fresh DB creates tables and reports zeros."""
     assert not _settings_env.exists()
     deleted = cleanup.main()
-    assert deleted == {"scan_events": 0, "serial_counters": 0, "address_cache": 0}
+    assert deleted == {"scan_events": 0, "address_cache": 0}
     assert _settings_env.exists()
 
 
