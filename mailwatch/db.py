@@ -31,11 +31,18 @@ CREATE TABLE IF NOT EXISTS app_state (
     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
-CREATE TABLE IF NOT EXISTS serial_counters (
-    day_bucket INTEGER PRIMARY KEY,
-    counter    INTEGER NOT NULL DEFAULT 0,
-    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+CREATE TABLE IF NOT EXISTS serial_state (
+    id      INTEGER PRIMARY KEY CHECK (id = 0),
+    counter INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS tracked_imbs (
+    imb           TEXT PRIMARY KEY,
+    serial        INTEGER NOT NULL,
+    recipient_zip TEXT,
+    created_at    INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS tracked_imbs_serial_idx ON tracked_imbs(serial);
 
 CREATE TABLE IF NOT EXISTS scan_events (
     event_id      TEXT PRIMARY KEY,
@@ -53,6 +60,17 @@ CREATE TABLE IF NOT EXISTS address_cache (
     cached_at     INTEGER NOT NULL DEFAULT (unixepoch())
 );
 """
+
+# Floor for the global monotonic serial counter. The serial field in an IMb is
+# only 6 digits when the Mailer ID is 9 digits (and 9 digits when the MID is 6),
+# so an IMb's tracking identity must stay unique for the full IV-MTR retention
+# window (~months). Earlier builds reset the counter per UTC day and encoded no
+# date into the IMb, so serial 1 on two different days produced *identical*
+# barcodes. The fix is a single ever-increasing counter that is never reset or
+# purged. The floor starts allocation safely above any low serial issued under
+# the old per-day scheme (historical daily volume was a handful), so a fresh
+# global counter can never collide with a letter already in the mail stream.
+SERIAL_FLOOR: int = 1000
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -109,43 +127,87 @@ def set_state(conn: sqlite3.Connection, key: str, value: bytes | str) -> None:
 # --- serial counters ---------------------------------------------------------
 
 
-def next_serial(conn: sqlite3.Connection, day_bucket: int) -> int:
-    """Atomically increment and return the counter for ``day_bucket``.
+def next_serial(conn: sqlite3.Connection, floor: int = SERIAL_FLOOR) -> int:
+    """Allocate the next single global monotonic serial.
 
-    Uses a single ``INSERT ... ON CONFLICT DO UPDATE ... RETURNING`` so the
-    read-modify-write is a single statement under SQLite's write lock — no
-    TOCTOU between concurrent callers.
+    Thin wrapper over :func:`next_serials` for the common single-letter case.
     """
-    row = conn.execute(
-        "INSERT INTO serial_counters (day_bucket, counter) VALUES (?, 1) "
-        "ON CONFLICT(day_bucket) DO UPDATE SET "
-        "counter = counter + 1, updated_at = unixepoch() "
-        "RETURNING counter",
-        (day_bucket,),
-    ).fetchone()
-    counter: int = row[0]
-    return counter
+    return next_serials(conn, 1, floor=floor)[0]
 
 
-def next_serials(conn: sqlite3.Connection, day_bucket: int, count: int) -> list[int]:
-    """Atomically allocate ``count`` consecutive serials from ``day_bucket``.
+def next_serials(conn: sqlite3.Connection, count: int, floor: int = SERIAL_FLOOR) -> list[int]:
+    """Atomically allocate ``count`` consecutive global serials.
 
-    One UPSERT bumps the counter by ``count`` under SQLite's write lock,
-    then returns the range the caller owns (``[first, ..., last]``). Two
-    concurrent callers never get overlapping ranges.
+    A single ``serial_state`` row (``id = 0``) holds an ever-increasing
+    counter that is **never reset and never purged** — this is what makes
+    every minted IMb globally unique (see :data:`SERIAL_FLOOR`). The counter
+    is seeded to ``floor`` on first use, so the first serial returned is
+    ``floor + 1``.
+
+    Allocation runs inside a ``BEGIN IMMEDIATE`` transaction so the
+    seed-then-increment is atomic under SQLite's write lock; two concurrent
+    callers therefore never receive overlapping ranges.
     """
     if count < 1:
         raise ValueError(f"count must be >= 1, got {count}")
-    row = conn.execute(
-        "INSERT INTO serial_counters (day_bucket, counter) VALUES (?, ?) "
-        "ON CONFLICT(day_bucket) DO UPDATE SET "
-        "counter = counter + excluded.counter, updated_at = unixepoch() "
-        "RETURNING counter",
-        (day_bucket, count),
-    ).fetchone()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO serial_state (id, counter) VALUES (0, ?)",
+            (floor,),
+        )
+        row = conn.execute(
+            "UPDATE serial_state SET counter = counter + ? WHERE id = 0 RETURNING counter",
+            (count,),
+        ).fetchone()
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
     last: int = row[0]
     first = last - count + 1
     return list(range(first, last + 1))
+
+
+# --- tracked IMb registry ----------------------------------------------------
+
+
+def register_imb(
+    conn: sqlite3.Connection,
+    imb: str,
+    serial: int,
+    recipient_zip: str | None = None,
+) -> bool:
+    """Record a generated IMb so the poller can track it without a prior scan.
+
+    The stored ``imb`` is the *full* queryable barcode (tracking digits +
+    routing code) — the exact string IV-MTR keys on. This is what lets
+    :func:`get_imb_by_serial` reconstruct the precise IMb for ``/track-ws``
+    (a typed ZIP can't reproduce the encoded 11-digit routing) and lets
+    :func:`get_pollable_imbs` bootstrap a freshly mailed letter that has no
+    scan event yet.
+
+    Idempotent via ``INSERT OR IGNORE`` on the IMb primary key. Returns True
+    when a new row was inserted.
+    """
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO tracked_imbs (imb, serial, recipient_zip) VALUES (?, ?, ?)",
+        (imb, serial, recipient_zip),
+    )
+    return cur.rowcount > 0
+
+
+def get_imb_by_serial(conn: sqlite3.Connection, serial: int) -> str | None:
+    """Return the full registered IMb for ``serial``, or None if unregistered.
+
+    Serials are globally unique (see :func:`next_serials`), so at most one row
+    matches; the ordering is a defensive tiebreak only.
+    """
+    row = conn.execute(
+        "SELECT imb FROM tracked_imbs WHERE serial = ? ORDER BY created_at DESC LIMIT 1",
+        (serial,),
+    ).fetchone()
+    return row[0] if row else None
 
 
 # --- scan events -------------------------------------------------------------
@@ -247,6 +309,45 @@ def get_in_flight_imbs(conn: sqlite3.Connection, lookback_days: int = 14) -> lis
     return result
 
 
+def get_pollable_imbs(
+    conn: sqlite3.Connection,
+    lookback_days: int = 14,
+    max_age_days: int = 45,
+) -> list[str]:
+    """Return every IMb the poller should query this pass.
+
+    The union of two sources:
+
+    1. **Scan-driven** — IMbs with a recent non-delivery scan
+       (:func:`get_in_flight_imbs`). Covers push-fed pieces and anything
+       seen only via the webhook.
+    2. **Registry-driven** — IMbs from :func:`register_imb` minted within
+       ``max_age_days`` whose latest scan (if any) isn't a delivery code.
+       This is what lets a *brand-new* letter be polled before its first
+       scan exists — the scan-driven source alone can never bootstrap one.
+
+    ``max_age_days`` bounds how long we keep polling a registered IMb that
+    never produces a delivery scan, so the poll set can't grow without
+    bound. Delivered pieces drop out of both sources.
+    """
+    pollable = set(get_in_flight_imbs(conn, lookback_days))
+    cutoff = int(time.time()) - max_age_days * 86400
+    rows = conn.execute(
+        "SELECT imb FROM tracked_imbs WHERE created_at >= ?",
+        (cutoff,),
+    ).fetchall()
+    for (imb,) in rows:
+        latest = conn.execute(
+            "SELECT event_json FROM scan_events WHERE imb = ? "
+            "ORDER BY created_at DESC, event_id DESC LIMIT 1",
+            (imb,),
+        ).fetchone()
+        if latest is not None and _is_delivered_payload(latest[0]):
+            continue
+        pollable.add(imb)
+    return sorted(pollable)
+
+
 def _is_delivered_payload(event_json: bytes | str | None) -> bool:
     """Return True if the decoded scan payload indicates delivery."""
     if not event_json:
@@ -324,10 +425,14 @@ def cache_put(conn: sqlite3.Connection, input_hash: str, response_json: bytes | 
 def purge_old(
     conn: sqlite3.Connection,
     scan_events_ttl_days: int = 60,
-    serial_counters_ttl_hours: int = 48,
     address_cache_ttl_days: int = 365,
 ) -> dict[str, int]:
     """Delete rows past their TTLs.
+
+    Note: ``serial_state`` is deliberately never purged — the global serial
+    counter must keep climbing forever to guarantee IMb uniqueness (see
+    :func:`next_serials`). ``tracked_imbs`` is likewise retained; it's tiny
+    (one row per letter) and feeds long-tail tracking lookups.
 
     Intentionally does not run ``VACUUM`` (that would rewrite the DB and
     invalidate the Litestream generation) or ``PRAGMA wal_checkpoint`` of
@@ -345,16 +450,11 @@ def purge_old(
         "DELETE FROM scan_events WHERE created_at < unixepoch() - ? * 86400",
         (scan_events_ttl_days,),
     )
-    serial_cur = conn.execute(
-        "DELETE FROM serial_counters WHERE updated_at < unixepoch() - ? * 3600",
-        (serial_counters_ttl_hours,),
-    )
     cache_cur = conn.execute(
         "DELETE FROM address_cache WHERE cached_at < unixepoch() - ? * 86400",
         (address_cache_ttl_days,),
     )
     return {
         "scan_events": scan_cur.rowcount,
-        "serial_counters": serial_cur.rowcount,
         "address_cache": cache_cur.rowcount,
     }

@@ -535,9 +535,9 @@ def test_preview_regen_keeps_same_serial(
     call_count = {"n": 0}
     real_next_serials = db.next_serials
 
-    def counting_next_serials(conn: Any, bucket: int, count: int) -> list[int]:
+    def counting_next_serials(conn: Any, count: int) -> list[int]:
         call_count["n"] += 1
-        return real_next_serials(conn, bucket, count)
+        return real_next_serials(conn, count)
 
     monkeypatch.setattr(routes.db, "next_serials", counting_next_serials)
 
@@ -770,6 +770,39 @@ def test_track_ws_merges_stored_events(client: TestClient, fake_tracking: Tracki
         events = [s["event"] for s in msg["scans"]]
         assert "AC" in events
         assert "SD" in events
+
+
+def test_generate_registers_full_imb(client: TestClient) -> None:
+    """/generate persists the full queryable IMb (tracking + 11-digit routing)."""
+    _submit_generate(client)
+    conn = client.app.state.db
+    rows = conn.execute("SELECT serial, imb FROM tracked_imbs").fetchall()
+    assert len(rows) == 1
+    serial, registered_imb = rows[0]
+    # 20-digit tracking + 11-digit routing (ZIP+4 + delivery point) = 31 digits.
+    assert len(registered_imb) == 31
+    assert registered_imb.endswith("20500000599")  # 20500-0005 + DP 99
+
+
+def test_track_ws_prefers_registered_imb_over_typed_zip(client: TestClient) -> None:
+    """track-ws must query the registered IMb by serial, ignoring a wrong ZIP.
+
+    The whole point of the registry: a typed 5/9-digit ZIP can't reproduce the
+    encoded 11-digit routing IV-MTR keys on, so the serial-keyed lookup wins.
+    """
+    _submit_generate(client)
+    conn = client.app.state.db
+    serial, registered_imb = conn.execute("SELECT serial, imb FROM tracked_imbs").fetchone()
+
+    captured = AsyncMock(return_value=TrackingResponse(data=None))
+    client.app.state.ivmtr.get_tracking = captured  # type: ignore[method-assign]
+
+    with client.websocket_connect("/track-ws") as ws:
+        # Deliberately wrong ZIP — the registry lookup must override it.
+        ws.send_text(json.dumps({"serial": serial, "receipt_zip": "00000"}))
+        ws.receive_json()
+
+    captured.assert_awaited_once_with(registered_imb)
 
 
 # --------------------------------------------------------------------------- #

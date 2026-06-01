@@ -46,7 +46,13 @@ def test_init_db_is_idempotent(tmp_path: Path) -> None:
         row[0]
         for row in c.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
     }
-    assert {"app_state", "serial_counters", "scan_events", "address_cache"} <= tables
+    assert {
+        "app_state",
+        "serial_state",
+        "tracked_imbs",
+        "scan_events",
+        "address_cache",
+    } <= tables
 
 
 # --- app_state K/V ----------------------------------------------------------
@@ -72,21 +78,92 @@ def test_state_upsert_overwrites(conn: sqlite3.Connection) -> None:
     assert db.get_state(conn, "k") == b"second"
 
 
-# --- serial counter ---------------------------------------------------------
+# --- serial counter (global monotonic) --------------------------------------
 
 
-def test_next_serial_starts_at_one_and_increments(conn: sqlite3.Connection) -> None:
-    assert db.next_serial(conn, 7) == 1
-    assert db.next_serial(conn, 7) == 2
-    assert db.next_serial(conn, 7) == 3
+def test_next_serial_starts_above_floor_and_increments(conn: sqlite3.Connection) -> None:
+    # First serial is floor+1; the counter is global and never resets.
+    assert db.next_serial(conn) == db.SERIAL_FLOOR + 1
+    assert db.next_serial(conn) == db.SERIAL_FLOOR + 2
+    assert db.next_serial(conn) == db.SERIAL_FLOOR + 3
 
 
-def test_next_serial_is_per_bucket(conn: sqlite3.Connection) -> None:
-    assert db.next_serial(conn, 1) == 1
-    assert db.next_serial(conn, 2) == 1
-    assert db.next_serial(conn, 1) == 2
-    assert db.next_serial(conn, 2) == 2
-    assert db.next_serial(conn, 3) == 1
+def test_next_serial_is_globally_monotonic_not_per_day(conn: sqlite3.Connection) -> None:
+    # There is exactly one counter — no per-bucket reset. Two "days" worth of
+    # allocations keep climbing, so no two pieces ever share a serial (and thus
+    # an IMb).
+    first = db.next_serial(conn)
+    second = db.next_serial(conn)
+    third = db.next_serial(conn)
+    assert first < second < third
+    assert len({first, second, third}) == 3
+
+
+def test_next_serials_allocates_contiguous_range(conn: sqlite3.Connection) -> None:
+    batch = db.next_serials(conn, 4)
+    assert batch == [
+        db.SERIAL_FLOOR + 1,
+        db.SERIAL_FLOOR + 2,
+        db.SERIAL_FLOOR + 3,
+        db.SERIAL_FLOOR + 4,
+    ]
+    # The next single serial continues past the batch — no overlap.
+    assert db.next_serial(conn) == db.SERIAL_FLOOR + 5
+
+
+def test_next_serials_respects_custom_floor(conn: sqlite3.Connection) -> None:
+    # The floor only seeds the very first allocation; later calls ignore it.
+    assert db.next_serials(conn, 1, floor=50_000) == [50_001]
+    assert db.next_serial(conn, floor=50_000) == 50_002
+
+
+def test_next_serials_rejects_non_positive_count(conn: sqlite3.Connection) -> None:
+    with pytest.raises(ValueError):
+        db.next_serials(conn, 0)
+
+
+# --- tracked IMb registry ---------------------------------------------------
+
+
+def test_register_imb_and_lookup_by_serial(conn: sqlite3.Connection) -> None:
+    full_imb = "0" * 31
+    assert db.register_imb(conn, full_imb, 1001, "10009") is True
+    # Idempotent: re-registering the same IMb is a no-op.
+    assert db.register_imb(conn, full_imb, 1001, "10009") is False
+    assert db.get_imb_by_serial(conn, 1001) == full_imb
+
+
+def test_get_imb_by_serial_missing_returns_none(conn: sqlite3.Connection) -> None:
+    assert db.get_imb_by_serial(conn, 9999) is None
+
+
+def test_pollable_includes_registered_imb_without_scans(conn: sqlite3.Connection) -> None:
+    # A freshly registered letter with no scan event must still be pollable —
+    # this is the bootstrap case the scan-only query could never cover.
+    db.register_imb(conn, "imb-fresh", 1001, "10009")
+    assert db.get_pollable_imbs(conn) == ["imb-fresh"]
+
+
+def test_pollable_excludes_delivered_registered_imb(conn: sqlite3.Connection) -> None:
+    db.register_imb(conn, "imb-done", 1001, "10009")
+    _insert_scan(conn, "e1", "imb-done", b'{"scanEventCode":"01"}', age_seconds=60)
+    assert db.get_pollable_imbs(conn) == []
+
+
+def test_pollable_excludes_registered_imb_past_max_age(conn: sqlite3.Connection) -> None:
+    # Registered 60 days ago, never delivered → outside the 45-day poll window.
+    conn.execute(
+        "INSERT INTO tracked_imbs (imb, serial, recipient_zip, created_at) "
+        "VALUES ('imb-stale', 1001, '10009', unixepoch() - 60 * 86400)"
+    )
+    assert db.get_pollable_imbs(conn) == []
+
+
+def test_pollable_unions_scan_and_registry_sources(conn: sqlite3.Connection) -> None:
+    # Scan-only IMb (e.g. push-fed, never registered) + a registry-only IMb.
+    _insert_scan(conn, "e1", "imb-scan", b'{"scanEventCode":"SD"}', age_seconds=60)
+    db.register_imb(conn, "imb-reg", 1001, "10009")
+    assert set(db.get_pollable_imbs(conn)) == {"imb-scan", "imb-reg"}
 
 
 # --- scan events ------------------------------------------------------------
@@ -184,15 +261,6 @@ def test_purge_old_respects_ttls(conn: sqlite3.Connection) -> None:
         "INSERT INTO scan_events (event_id, imb, event_json, scan_datetime, created_at) "
         "VALUES ('stale', 'imb1', '{}', NULL, unixepoch() - 70 * 86400)"
     )
-    # serial_counters: fresh + stale
-    conn.execute(
-        "INSERT INTO serial_counters (day_bucket, counter, updated_at) "
-        "VALUES (10, 5, unixepoch())"
-    )
-    conn.execute(
-        "INSERT INTO serial_counters (day_bucket, counter, updated_at) "
-        "VALUES (11, 5, unixepoch() - 72 * 3600)"
-    )
     # address_cache: fresh + stale (400 days > 365 default)
     conn.execute(
         "INSERT INTO address_cache (input_hash, response_json, cached_at) "
@@ -204,21 +272,29 @@ def test_purge_old_respects_ttls(conn: sqlite3.Connection) -> None:
     )
 
     deleted = db.purge_old(conn)
-    assert deleted == {"scan_events": 1, "serial_counters": 1, "address_cache": 1}
+    assert deleted == {"scan_events": 1, "address_cache": 1}
 
     # Fresh rows survive
     assert conn.execute("SELECT COUNT(*) FROM scan_events").fetchone()[0] == 1
-    assert conn.execute("SELECT COUNT(*) FROM serial_counters").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM address_cache").fetchone()[0] == 1
     # Specifically the stale ones went
     assert conn.execute("SELECT event_id FROM scan_events").fetchone()[0] == "fresh"
-    assert conn.execute("SELECT day_bucket FROM serial_counters").fetchone()[0] == 10
     assert conn.execute("SELECT input_hash FROM address_cache").fetchone()[0] == "fresh"
+
+
+def test_purge_old_never_touches_serial_state(conn: sqlite3.Connection) -> None:
+    # The global serial counter must survive cleanup forever — purging it would
+    # reset serials and risk reusing an IMb already in the mail stream.
+    db.next_serials(conn, 3)  # seed + advance the counter
+    before = conn.execute("SELECT counter FROM serial_state WHERE id = 0").fetchone()[0]
+    db.purge_old(conn)
+    after = conn.execute("SELECT counter FROM serial_state WHERE id = 0").fetchone()[0]
+    assert after == before
 
 
 def test_purge_old_on_empty_tables(conn: sqlite3.Connection) -> None:
     deleted = db.purge_old(conn)
-    assert deleted == {"scan_events": 0, "serial_counters": 0, "address_cache": 0}
+    assert deleted == {"scan_events": 0, "address_cache": 0}
 
 
 # --- in-flight IMbs ---------------------------------------------------------

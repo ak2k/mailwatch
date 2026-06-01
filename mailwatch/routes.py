@@ -20,7 +20,6 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from time import time as _now
 from typing import Annotated, Any, Literal
 from urllib.parse import urlencode
 
@@ -204,10 +203,21 @@ def _build_routing(zip_value: str, delivery_point: str | None) -> str:
     return digits
 
 
-def _day_bucket(epoch_seconds: float | None = None) -> int:
-    """Return the UTC-day integer used as the ``serial_counters`` PK."""
-    ts = epoch_seconds if epoch_seconds is not None else _now()
-    return int(ts // 86400)
+async def _register_pieces(
+    conn: sqlite3.Connection,
+    lock: asyncio.Lock,
+    serials: list[int],
+    trackings: list[str],
+    routing: str,
+    recipient_zip: str,
+) -> None:
+    """Persist each piece's full IMb (tracking + routing) to ``tracked_imbs``.
+
+    Lets the poller bootstrap a letter before its first scan and lets
+    /track-ws recover the exact encoded routing from the serial alone.
+    """
+    for serial, tracking in zip(serials, trackings, strict=True):
+        await _db_call(lock, db.register_imb, conn, f"{tracking}{routing}", serial, recipient_zip)
 
 
 def _build_tracking(settings: Settings, serial: int) -> str:
@@ -421,14 +431,13 @@ async def post_generate(
     recipient, effective_dp = await _standardize_for_generate(form, new_api)
 
     conn, lock = locked
-    bucket = _day_bucket()
     # Mint a single serial — the common-case output. Batch size is an
     # output option on /preview; extra serials are minted on demand by
     # :func:`_ensure_batch_size` when the user picks count > 1. Minting
     # the first one here (rather than waiting for /preview) keeps
     # /preview's "session required" guard meaningful: hitting /preview
     # without a prior /generate still yields the empty-session 400.
-    serials: list[int] = await _db_call(lock, db.next_serials, conn, bucket, 1)
+    serials: list[int] = await _db_call(lock, db.next_serials, conn, 1)
     trackings: list[str] = [_build_tracking(settings, serials[0])]
     routing = _build_routing(str(recipient["zip"]), effective_dp)
     # Validate encoding end-to-end — raises ValueError on any out-of-range field.
@@ -439,6 +448,11 @@ async def post_generate(
         serials[0],
         routing,
     )
+
+    # Register the full queryable IMb (tracking + routing) so the poller can
+    # track this letter before its first scan and so /track-ws can recover the
+    # exact 11-digit routing from the serial alone (a typed ZIP can't).
+    await _register_pieces(conn, lock, serials, trackings, routing, str(recipient["zip"]))
 
     # Session holds the piece-of-mail identity (sender/recipient + the
     # growing lists of serials/trackings). Output-format preferences
@@ -482,8 +496,7 @@ async def _ensure_batch_size(
         return piece
     extra = count - piece.count
     conn, lock = locked
-    bucket = _day_bucket()
-    new_serials: list[int] = await _db_call(lock, db.next_serials, conn, bucket, extra)
+    new_serials: list[int] = await _db_call(lock, db.next_serials, conn, extra)
     new_trackings = [_build_tracking(settings, s) for s in new_serials]
     for serial in new_serials:
         imb.encode(
@@ -493,6 +506,9 @@ async def _ensure_batch_size(
             serial,
             piece.routing,
         )
+    await _register_pieces(
+        conn, lock, new_serials, new_trackings, piece.routing, piece.recipient_zip
+    )
     combined_serials = list(piece.serials) + new_serials
     combined_trackings = list(piece.trackings) + new_trackings
     request.session["serials"] = combined_serials
@@ -859,9 +875,16 @@ async def track_ws(websocket: WebSocket) -> None:
                 await websocket.send_json({"error": "invalid JSON"})
                 continue
 
-            routing = _clean_zip(parsed.receipt_zip)
+            # Prefer the exact IMb registered at /generate time — it carries
+            # the full encoded routing (ZIP+4 + 2-digit delivery point) that
+            # IV-MTR keys on. The typed ZIP can only rebuild a 5/9-digit
+            # routing, which would never match a piece USPS has under its
+            # 11-digit routing. Fall back to the reconstructed key for letters
+            # generated before the registry existed (or in another session).
             tracking = _build_tracking(settings, parsed.serial)
-            imb_key = f"{tracking}{routing}"
+            fallback_key = f"{tracking}{_clean_zip(parsed.receipt_zip)}"
+            stored_imb = await _db_call(lock, db.get_imb_by_serial, conn, parsed.serial)
+            imb_key = stored_imb or fallback_key
 
             merged: list[dict[str, Any]] = []
 

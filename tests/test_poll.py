@@ -181,6 +181,55 @@ async def test_single_imb_stores_new_scans(settings: Settings) -> None:
     assert scan_codes == {"SD", "DP"}
 
 
+async def test_registered_imb_is_polled_before_first_scan(settings: Settings) -> None:
+    """A registry-only IMb (no scan_event yet) must be polled and ingested.
+
+    This is the bootstrap path: the scan-only query could never discover a
+    freshly mailed letter, so the poller would never fetch its first scan.
+    """
+    imb = "9" * 31
+    conn = db.connect(settings.DB_PATH)
+    db.init_db(conn)
+    db.register_imb(conn, imb, 1001, "10009")  # registered, zero scans
+    _prime_iv_token(conn)
+    conn.close()
+
+    recorder = Recorder()
+    recorder.add(
+        "GET",
+        IV_TRACKING_URL,
+        lambda _r: httpx.Response(
+            200,
+            json={
+                "message": None,
+                "data": {
+                    "imb": imb,
+                    "scans": [
+                        {
+                            "scan_date_time": "2026-05-30T02:02:04",
+                            "scan_event_code": "919",
+                            "scan_facility_city": "NEW YORK",
+                            "scan_facility_state": "NY",
+                            "scan_facility_zip": "10199",
+                        }
+                    ],
+                },
+            },
+        ),
+    )
+
+    transport = httpx.MockTransport(recorder)
+    async with httpx.AsyncClient(transport=transport) as http:
+        result = await poll._poll_once(settings, http_client=http)
+
+    assert result == {"polled": 1, "new_events": 1, "errors": 0}
+    conn = db.connect(settings.DB_PATH)
+    events = db.get_scan_events(conn, imb)
+    conn.close()
+    assert len(events) == 1
+    assert events[0]["event"]["scanEventCode"] == "919"
+
+
 async def test_idempotent_second_run_stores_nothing(settings: Settings) -> None:
     """Running twice against the same mocked payload is a no-op on run 2."""
     imb = "1" * 20
