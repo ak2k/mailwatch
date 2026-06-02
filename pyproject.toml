@@ -55,6 +55,14 @@ dev = [
     "pypdf>=5.0,<7",
 ]
 
+# Optional: the backup browser-driven address resolver (mailwatch.web_lookup /
+# mailwatch.cli_resolve). Heavy + downloads a browser at runtime, so it is kept
+# out of the main service deps — only the `resolve-address` flake app and the
+# integration test need it. Drives the nix-provided Chromium.
+browser = [
+    "nodriver>=0.50,<1",
+]
+
 [build-system]
 requires = ["uv_build>=0.11.0,<0.12.0"]
 build-backend = "uv_build"
@@ -122,6 +130,10 @@ warn_required_dynamic_aliases = true
 module = ["weasyprint.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["nodriver.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
@@ -134,6 +146,10 @@ addopts = [
     "--cov=mailwatch",
     "--cov-report=term-missing:skip-covered",
     "--cov-report=xml",
+    # Integration tests (real browser → live USPS) are opt-in: run them with
+    # `nix run .#test -- -m integration` on a host with Chromium+xvfb.
+    "-m",
+    "not integration",
 ]
 filterwarnings = [
     "error",
@@ -147,7 +163,9 @@ markers = [
 [tool.coverage.run]
 source = ["mailwatch"]
 branch = true
-omit = ["tests/*", "mailwatch/_generated/*", "mailwatch/__main__.py"]
+# cli_resolve is a thin argparse entrypoint over the (browser-driven) resolver,
+# exercised manually / by the integration test, like __main__.py.
+omit = ["tests/*", "mailwatch/_generated/*", "mailwatch/__main__.py", "mailwatch/cli_resolve.py"]
 
 [tool.coverage.report]
 precision = 1

@@ -154,6 +154,24 @@
             meta.description = "Run mailwatch's pytest suite with WeasyPrint libs on the path";
           };
         }
+        # `nix run .#resolve-address -- "<street>" --city C --state ST --zip 12345`
+        # Backup USPS address resolver (mailwatch.cli_resolve): drives the
+        # nix-provided Chromium headful under xvfb to seed address_cache when
+        # apis.usps.com is unavailable. Linux-only — needs Chromium + Xvfb.
+        // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          resolve-address = {
+            type = "app";
+            program = toString (
+              pkgs.writeShellScript "mailwatch-resolve-address" ''
+                ${libEnv}
+                export CHROME_BIN=${pkgs.chromium}/bin/chromium
+                exec ${pkgs.xvfb-run}/bin/xvfb-run -a \
+                  ${devEnv}/bin/python -m mailwatch.cli_resolve "$@"
+              ''
+            );
+            meta.description = "Backup USPS address resolver (Chromium+xvfb) — seeds address_cache";
+          };
+        }
       );
 
       checks = forAllSystems (
@@ -177,7 +195,9 @@
             export HOME=$TMPDIR
             export PYTEST_CACHE_DIR=$TMPDIR/.pytest_cache
             ${libEnv}
-            pytest
+            # Integration tests hit live USPS through a real browser — excluded
+            # from the sandboxed check (no network/display/Chromium here).
+            pytest -m "not integration"
             touch $out
           '';
           lint = pkgs.runCommand "mailwatch-lint" { nativeBuildInputs = [ devEnv ]; } ''
