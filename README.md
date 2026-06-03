@@ -108,6 +108,46 @@ All configuration is read from environment variables (see `.env.example`). Secre
 
 USPS's default tier for new developer accounts is **60 req/hr per application** across all endpoints on `apis.usps.com` (addresses + tracking + labels). Request a tier upgrade to 300 req/hr by emailing `emailus.usps.com` with your CRID, app name, and mailer-use justification. IV-MTR tracking calls (`iv.usps.com`) are on a separate bucket.
 
+## Backup address resolver (when the Addresses API is unavailable)
+
+Address standardization normally goes through the official `apis.usps.com`
+Addresses API (`NewApiClient`). If that API is down — or after USPS's
+2026-07-12 move of the Addresses API to a paid, licensed tier — a standby
+resolver can keep `/generate` producing full ZIP+4 + 11-digit-routing barcodes
+for **$0**.
+
+It drives USPS's free consumer ZIP-lookup (`tools.usps.com`) with a real
+browser. That endpoint sits behind Akamai Bot Manager, which requires a live
+JS-sensor session, so plain HTTP clients are blocked; the resolver uses
+`nodriver` + Chromium, headful under `xvfb`. It writes results straight into
+the `address_cache` table — keyed identically to what `/generate` looks up — so
+**the service and its request path are unchanged**; they simply get a cache hit
+and skip the API.
+
+Linux-only (needs Chromium + Xvfb), in the optional `browser` dependency group:
+
+```sh
+# On the mailwatch host. Pass the SAME recipient fields you'd enter on /generate
+# (the cache key is the hash of that raw input):
+nix run .#resolve-address -- "475 L'Enfant Plaza SW" \
+    --city Washington --state DC --zip 20260
+#   --company / --address2  if the recipient has them
+#   --print-only            resolve without writing the cache
+#   --db <path>             target DB (default: $DB_PATH)
+```
+
+Verify the resolver still beats Akamai (live canary, opt-in):
+
+```sh
+nix run .#test -- -m integration
+```
+
+Caveats: this automates a free public tool, which is a gray area in USPS's
+terms of use — it's a low-volume fallback, not the default path. Keep volume
+low; results are cached for a year. The browser engine is isolated behind
+`mailwatch/web_lookup.py`, so it can be swapped (e.g. for Camoufox) without
+touching callers.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
