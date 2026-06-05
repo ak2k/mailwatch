@@ -151,6 +151,30 @@ button.primary:hover, .button-link.primary:hover {
 .status-closed { color: var(--muted); }
 .status-error { border-color: var(--error); color: var(--error); }
 
+.recent-list { list-style: none; padding: 0; margin: 0; }
+.recent-item { margin-bottom: 0.5rem; }
+.recent-link {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2rem 0.9rem;
+  padding: 0.6rem 0.75rem; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--surface);
+  text-decoration: none; color: var(--fg);
+}
+.recent-link:hover { border-color: var(--accent); color: var(--fg); }
+.recent-who { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2rem 0.5rem; }
+.recent-name { font-weight: 600; }
+.recent-company { color: var(--muted); font-size: 0.9rem; }
+.recent-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2rem 0.6rem; }
+.recent-serial { color: var(--muted); font-variant-numeric: tabular-nums; }
+.recent-zip { color: var(--muted); }
+.recent-time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 0.9rem; }
+.recent-status {
+  margin-left: auto; font-size: 0.85rem; font-weight: 500;
+  padding: 0.05rem 0.5rem; border: 1px solid var(--border); border-radius: 999px;
+}
+.recent-status-delivered { color: var(--ok); border-color: var(--ok); }
+.recent-status-in_transit { color: var(--accent); border-color: var(--accent); }
+.recent-status-awaiting { color: var(--muted); }
+
 .scans { list-style: none; padding: 0; margin: 0; }
 .scan {
   padding: 0.6rem 0.75rem; border: 1px solid var(--border);

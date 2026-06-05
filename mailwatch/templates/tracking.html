@@ -31,6 +31,40 @@
   </div>
 </form>
 
+{% if recent %}
+<section class="stack">
+  <h2>Recently generated</h2>
+  <p class="muted">
+    Pick a letter to load its serial and ZIP into the form above and start tracking.
+  </p>
+  <ul class="recent-list">
+    {% for item in recent %}
+    <li class="recent-item">
+      <a class="recent-link"
+         href="/tracking?serial={{ item.serial }}&amp;zip={{ item.recipient_zip | urlencode }}">
+        <span class="recent-who">
+          <span class="recent-name">{{ item.recipient_name or 'Unnamed recipient' }}</span>
+          {% if item.recipient_company %}
+          <span class="recent-company">{{ item.recipient_company }}</span>
+          {% endif %}
+        </span>
+        <span class="recent-meta">
+          <span class="recent-serial">#{{ item.serial }}</span>
+          <span class="recent-zip">ZIP {{ item.recipient_zip }}</span>
+          <time class="recent-time" datetime="{{ item.created_iso }}">{{ item.created_iso }}</time>
+        </span>
+        <span class="recent-status recent-status-{{ item.status }}">
+          {%- if item.status == 'delivered' -%}Delivered
+          {%- elif item.status == 'in_transit' -%}In transit
+          {%- else -%}Awaiting first scan{%- endif -%}
+        </span>
+      </a>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
 <section class="stack">
   <h2>Status</h2>
   <p id="status" class="status status-idle">Idle. Submit the form above to connect.</p>
@@ -44,6 +78,20 @@
 {% endblock %}
 
 {% block scripts %}
+<script>
+  // Localize the "Recently generated" timestamps (rendered as UTC ISO).
+  (function () {
+    var times = document.querySelectorAll('.recent-time');
+    for (var i = 0; i < times.length; i++) {
+      var iso = times[i].getAttribute('datetime');
+      if (!iso) { continue; }
+      var d = new Date(iso);
+      if (!isNaN(d.getTime())) {
+        times[i].textContent = d.toLocaleString();
+      }
+    }
+  })();
+</script>
 <script>
   (function () {
     var form = document.getElementById('track-form');

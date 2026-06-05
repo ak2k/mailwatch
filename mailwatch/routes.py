@@ -19,6 +19,7 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlencode
@@ -210,14 +211,27 @@ async def _register_pieces(
     trackings: list[str],
     routing: str,
     recipient_zip: str,
+    recipient_name: str | None = None,
+    recipient_company: str | None = None,
 ) -> None:
     """Persist each piece's full IMb (tracking + routing) to ``tracked_imbs``.
 
     Lets the poller bootstrap a letter before its first scan and lets
     /track-ws recover the exact encoded routing from the serial alone.
+    ``recipient_name`` / ``recipient_company`` are display-only metadata
+    surfaced on the tracking page's recent-letters list.
     """
     for serial, tracking in zip(serials, trackings, strict=True):
-        await _db_call(lock, db.register_imb, conn, f"{tracking}{routing}", serial, recipient_zip)
+        await _db_call(
+            lock,
+            db.register_imb,
+            conn,
+            f"{tracking}{routing}",
+            serial,
+            recipient_zip,
+            recipient_name,
+            recipient_company,
+        )
 
 
 def _build_tracking(settings: Settings, serial: int) -> str:
@@ -280,6 +294,16 @@ class MailPiece:
     @property
     def recipient_zip(self) -> str:
         return str(self.recipient["zip"])
+
+    @property
+    def recipient_name(self) -> str | None:
+        name = self.recipient.get("name")
+        return str(name) if name else None
+
+    @property
+    def recipient_company(self) -> str | None:
+        company = self.recipient.get("company")
+        return str(company) if company else None
 
     def sender_lines(self) -> list[str]:
         """Split the sender textarea into non-empty display lines."""
@@ -452,7 +476,16 @@ async def post_generate(
     # Register the full queryable IMb (tracking + routing) so the poller can
     # track this letter before its first scan and so /track-ws can recover the
     # exact 11-digit routing from the serial alone (a typed ZIP can't).
-    await _register_pieces(conn, lock, serials, trackings, routing, str(recipient["zip"]))
+    await _register_pieces(
+        conn,
+        lock,
+        serials,
+        trackings,
+        routing,
+        str(recipient["zip"]),
+        recipient_name=recipient.get("name"),
+        recipient_company=recipient.get("company"),
+    )
 
     # Session holds the piece-of-mail identity (sender/recipient + the
     # growing lists of serials/trackings). Output-format preferences
@@ -507,7 +540,14 @@ async def _ensure_batch_size(
             piece.routing,
         )
     await _register_pieces(
-        conn, lock, new_serials, new_trackings, piece.routing, piece.recipient_zip
+        conn,
+        lock,
+        new_serials,
+        new_trackings,
+        piece.routing,
+        piece.recipient_zip,
+        recipient_name=piece.recipient_name,
+        recipient_company=piece.recipient_company,
     )
     combined_serials = list(piece.serials) + new_serials
     combined_trackings = list(piece.trackings) + new_trackings
@@ -828,17 +868,49 @@ async def post_validate_address(
     )
 
 
+def _epoch_to_iso(epoch: int) -> str:
+    """Render a unix epoch (seconds, UTC) as an ISO-8601 ``Z`` string.
+
+    Used for the ``datetime`` attribute on recent-tracking rows; the page's
+    JavaScript localizes it for display, matching the scan-event formatting.
+    """
+    return datetime.fromtimestamp(epoch, tz=UTC).isoformat().replace("+00:00", "Z")
+
+
 @router.get("/tracking", response_class=HTMLResponse)
 async def get_tracking(
     request: Request,
     serial: str | None = None,
     zip: str | None = None,
+    settings: Settings = Depends(get_settings_dep),
+    db_locked: tuple[sqlite3.Connection, asyncio.Lock] = Depends(get_db_locked),
 ) -> Response:
-    """Render the tracking-form page with optional prefilled fields."""
+    """Render the tracking-form page with optional prefilled fields.
+
+    When ``SHOW_RECENT_TRACKING`` is enabled, the page also lists the most
+    recently generated letters (serial + recipient ZIP + coarse status) as
+    clickable references, so the operator can pick one instead of retyping a
+    serial and ZIP from memory.
+    """
+    recent: list[dict[str, Any]] = []
+    if settings.SHOW_RECENT_TRACKING:
+        conn, lock = db_locked
+        rows = await _db_call(lock, db.recent_tracked_imbs, conn, settings.RECENT_TRACKING_LIMIT)
+        recent = [
+            {
+                "serial": row["serial"],
+                "recipient_zip": row["recipient_zip"],
+                "recipient_name": row["recipient_name"],
+                "recipient_company": row["recipient_company"],
+                "status": row["status"],
+                "created_iso": _epoch_to_iso(row["created_at"]),
+            }
+            for row in rows
+        ]
     return templates.TemplateResponse(
         request,
         "tracking.html",
-        {"serial": serial, "recipient_zip": zip},
+        {"serial": serial, "recipient_zip": zip, "recent": recent},
     )
 
 
