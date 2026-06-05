@@ -68,6 +68,7 @@
 <section class="stack">
   <h2>Status</h2>
   <p id="status" class="status status-idle">Idle. Submit the form above to connect.</p>
+  <p id="eta" class="eta" hidden></p>
 
   <h2>Scan events</h2>
   <p id="empty-notice" class="muted">
@@ -98,6 +99,7 @@
     var serialInput = document.getElementById('serial');
     var zipInput = document.getElementById('zip');
     var statusEl = document.getElementById('status');
+    var etaEl = document.getElementById('eta');
     var scansEl = document.getElementById('scans');
     var emptyNotice = document.getElementById('empty-notice');
 
@@ -127,6 +129,12 @@
       var li = document.createElement('li');
       li.className = 'scan';
 
+      // Header: timestamp + the human-readable mail phase USPS reports
+      // (e.g. "Phase 3c - Destination Sequenced Carrier Sortation"),
+      // falling back to the raw operation code when no phase is present.
+      var head = document.createElement('div');
+      head.className = 'scan-head';
+
       var when = document.createElement('time');
       when.className = 'scan-time';
       if (scan.timestamp) {
@@ -136,23 +144,40 @@
 
       var what = document.createElement('span');
       what.className = 'scan-event';
-      what.textContent = scan.event || scan.description || 'Scan';
+      what.textContent = scan.phase || scan.event || scan.description || 'Scan';
 
-      var where = document.createElement('span');
-      where.className = 'scan-location';
-      if (scan.location) {
-        where.textContent = scan.location;
-      }
+      head.appendChild(when);
+      head.appendChild(document.createTextNode(' — '));
+      head.appendChild(what);
+      li.appendChild(head);
 
-      li.appendChild(when);
-      li.appendChild(document.createTextNode(' — '));
-      li.appendChild(what);
-      if (scan.location) {
-        li.appendChild(document.createTextNode(' @ '));
-        li.appendChild(where);
+      // Detail: operation code (only when the phase was the headline, so we
+      // don't repeat it), processing machine, and facility location.
+      var bits = [];
+      if (scan.phase && scan.event) { bits.push('op ' + scan.event); }
+      if (scan.machine) { bits.push(scan.machine); }
+      if (scan.location) { bits.push(scan.location); }
+      if (bits.length) {
+        var detail = document.createElement('div');
+        detail.className = 'scan-detail';
+        detail.textContent = bits.join(' · ');
+        li.appendChild(detail);
       }
 
       scansEl.insertBefore(li, scansEl.firstChild);
+    }
+
+    function showEta(eta) {
+      if (!eta) { return; }
+      var text = String(eta);
+      var d = new Date(eta);
+      if (!isNaN(d.getTime())) {
+        text = d.toLocaleDateString(undefined, {
+          weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+        });
+      }
+      etaEl.textContent = 'Expected delivery: ' + text;
+      etaEl.hidden = false;
     }
 
     function connect(serial, zip) {
@@ -163,6 +188,8 @@
       scansEl.innerHTML = '';
       receivedAny = false;
       emptyNotice.hidden = false;
+      etaEl.hidden = true;
+      etaEl.textContent = '';
 
       var proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       var url = proto + '//' + window.location.host + '/track-ws';
@@ -191,6 +218,9 @@
         if (data.error) {
           setStatus('Error: ' + data.error, 'status-error');
           return;
+        }
+        if (data.eta) {
+          showEta(data.eta);
         }
         if (Array.isArray(data.scans)) {
           data.scans.forEach(prependScan);

@@ -41,7 +41,7 @@ from mailwatch import db, imb, pdf
 from mailwatch.avery import AVERY, DEFAULT_AVERY, DISPLAY_NAMES as _AVERY_LABELS
 from mailwatch.config import Settings
 from mailwatch.layouts import DEFAULT_ENVELOPE, DISPLAY_NAMES as _ENVELOPE_LABELS, ENVELOPES
-from mailwatch.models import AddressRequest, PushFeedPayload
+from mailwatch.models import AddressRequest, PushFeedPayload, TrackingResponse
 from mailwatch.usps_api import IVMTRClient, NewApiClient
 
 # Practical ceiling on any single session field so the cookie stays under
@@ -958,60 +958,80 @@ async def track_ws(websocket: WebSocket) -> None:
             stored_imb = await _db_call(lock, db.get_imb_by_serial, conn, parsed.serial)
             imb_key = stored_imb or fallback_key
 
-            merged: list[dict[str, Any]] = []
-
             try:
                 live = await ivmtr.get_tracking(imb_key)
             except Exception as exc:  # noqa: BLE001 — live-pull failure falls back to stored events
                 logger.info("IV-MTR live pull failed: %s", exc)
                 live = None
 
-            seen: set[str] = set()
-            if live is not None and live.data is not None:
-                for scan in live.data.scans:
-                    key = f"{scan.scanDatetime.isoformat()}|{scan.scanEventCode}"
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    merged.append(
-                        {
-                            "timestamp": scan.scanDatetime.isoformat(),
-                            "event": scan.scanEventCode,
-                            "location": _format_location(
-                                scan.scanFacilityCity,
-                                scan.scanFacilityState,
-                                scan.scanFacilityZip,
-                            ),
-                            "source": "live",
-                        }
-                    )
-
             stored = await _db_call(lock, db.get_scan_events, conn, imb_key)
-            for row_data in stored:
-                payload = row_data.get("event") or {}
-                scan_dt = row_data.get("scan_datetime") or payload.get("scanDatetime")
-                event_code = payload.get("scanEventCode") or "SCAN"
-                key = f"{scan_dt}|{event_code}"
-                if key in seen:
-                    continue
-                seen.add(key)
-                merged.append(
-                    {
-                        "timestamp": scan_dt,
-                        "event": event_code,
-                        "location": _format_location(
-                            payload.get("scanFacilityCity"),
-                            payload.get("scanFacilityState"),
-                            payload.get("scanFacilityZip"),
-                        ),
-                        "source": "stored",
-                    }
-                )
-
-            merged.sort(key=lambda s: s.get("timestamp") or "", reverse=True)
-            await websocket.send_json({"scans": merged})
+            merged, eta = _merge_scan_sources(live, stored)
+            await websocket.send_json({"scans": merged, "eta": eta})
     except WebSocketDisconnect:
         return
+
+
+def _merge_scan_sources(
+    live: TrackingResponse | None,
+    stored: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Merge live IV-MTR scans with webhook/poll-stored events, newest first.
+
+    De-dupes on ``(timestamp, operation code)``; a live scan wins over a stored
+    one for the same key. Each merged scan carries the human-readable mail
+    phase (e.g. "Destination Sequenced Carrier Sortation"), the processing
+    machine, and the facility location alongside the raw code. Also returns the
+    piece-level expected-delivery ETA from the live pull, or ``None``.
+    """
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    eta: str | None = None
+
+    if live is not None and live.data is not None:
+        eta = live.data.expected_delivery_date
+        for scan in live.data.scans:
+            key = f"{scan.scanDatetime.isoformat()}|{scan.scanEventCode}"
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(
+                {
+                    "timestamp": scan.scanDatetime.isoformat(),
+                    "event": scan.scanEventCode,
+                    "phase": scan.mailPhase,
+                    "machine": scan.machineName,
+                    "location": _format_location(
+                        scan.scanFacilityCity, scan.scanFacilityState, scan.scanFacilityZip
+                    ),
+                    "source": "live",
+                }
+            )
+
+    for row_data in stored:
+        payload = row_data.get("event") or {}
+        scan_dt = row_data.get("scan_datetime") or payload.get("scanDatetime")
+        event_code = payload.get("scanEventCode") or "SCAN"
+        key = f"{scan_dt}|{event_code}"
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(
+            {
+                "timestamp": scan_dt,
+                "event": event_code,
+                "phase": payload.get("mailPhase"),
+                "machine": payload.get("machineName"),
+                "location": _format_location(
+                    payload.get("scanFacilityCity"),
+                    payload.get("scanFacilityState"),
+                    payload.get("scanFacilityZip"),
+                ),
+                "source": "stored",
+            }
+        )
+
+    merged.sort(key=lambda s: s.get("timestamp") or "", reverse=True)
+    return merged, eta
 
 
 def _format_location(city: str | None, state: str | None, zip_code: str | None) -> str | None:

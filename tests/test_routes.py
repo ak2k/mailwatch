@@ -64,6 +64,7 @@ def fake_tracking() -> TrackingResponse:
     return TrackingResponse(
         data=TrackingData(
             imb="9" * 31,
+            expected_delivery_date="2026-04-23",
             scans=[
                 TrackingScan(
                     imb="9" * 31,
@@ -72,6 +73,8 @@ def fake_tracking() -> TrackingResponse:
                     scanFacilityCity="WASHINGTON",
                     scanFacilityState="DC",
                     scanFacilityZip="20018",
+                    machineName="DBCS-051",
+                    mailPhase="Phase 3c - Destination Sequenced Carrier Sortation",
                 )
             ],
         )
@@ -725,8 +728,14 @@ def test_track_ws_returns_merged_scans(client: TestClient) -> None:
         assert "scans" in msg
         # Live fake returned 1 scan.
         assert len(msg["scans"]) >= 1
-        assert msg["scans"][0]["event"] == "SD"
-        assert msg["scans"][0]["location"].startswith("WASHINGTON")
+        scan = msg["scans"][0]
+        assert scan["event"] == "SD"
+        assert scan["location"].startswith("WASHINGTON")
+        # Richer per-scan detail surfaced from the IV-MTR payload.
+        assert scan["phase"] == "Phase 3c - Destination Sequenced Carrier Sortation"
+        assert scan["machine"] == "DBCS-051"
+        # Piece-level expected-delivery ETA is forwarded to the client.
+        assert msg["eta"] == "2026-04-23"
 
 
 def test_track_ws_rejects_invalid_payload(client: TestClient) -> None:
@@ -749,8 +758,8 @@ def test_track_ws_survives_live_pull_failure(client: TestClient) -> None:
     with client.websocket_connect("/track-ws") as ws:
         ws.send_text(json.dumps({"serial": 1, "receipt_zip": "20500"}))
         msg = ws.receive_json()
-        # Empty live results, no stored events -> empty list.
-        assert msg == {"scans": []}
+        # Empty live results, no stored events -> empty list, no ETA.
+        assert msg == {"scans": [], "eta": None}
 
 
 def test_generate_with_mailer_id_starting_with_9(tmp_path: Path) -> None:
@@ -903,3 +912,79 @@ def test_usps_feed_rejects_non_allowlisted_ip(tmp_path: Path) -> None:
     with TestClient(app) as c:
         resp = c.post("/usps_feed", json=_sample_push())
     assert resp.status_code == 403
+
+
+# --------------------------------------------------------------------------- #
+# _merge_scan_sources (live + stored merge)                                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_merge_scan_sources_live_wins_and_maps_fields() -> None:
+    """Live + stored merge: dedup by (ts, code), live wins, rich fields mapped."""
+    from mailwatch.routes import _merge_scan_sources
+
+    live = TrackingResponse(
+        data=TrackingData(
+            imb="9" * 31,
+            expected_delivery_date="2026-04-23",
+            scans=[
+                TrackingScan(
+                    scanDatetime="2026-04-21T09:00:00Z",  # type: ignore[arg-type]
+                    scanEventCode="SD",
+                    scanFacilityCity="WASHINGTON",
+                    scanFacilityState="DC",
+                    scanFacilityZip="20018",
+                    machineName="DBCS-051",
+                    mailPhase="Phase 3c - Destination Sequenced Carrier Sortation",
+                )
+            ],
+        )
+    )
+    stored = [
+        # Same (timestamp, code) as the live scan → dropped in favor of live.
+        {
+            "event": {"scanEventCode": "SD", "scanDatetime": "2026-04-21T09:00:00+00:00"},
+            "scan_datetime": "2026-04-21T09:00:00+00:00",
+        },
+        # Distinct earlier stored-only event.
+        {
+            "event": {
+                "scanEventCode": "AC",
+                "scanFacilityCity": "BOSTON",
+                "scanFacilityState": "MA",
+                "scanFacilityZip": "02110",
+                "mailPhase": "Phase 0 - Origin Processing",
+                "machineName": "AFCS200-005",
+            },
+            "scan_datetime": "2026-04-20T08:00:00+00:00",
+        },
+    ]
+
+    merged, eta = _merge_scan_sources(live, stored)
+
+    assert eta == "2026-04-23"
+    # Newest first; the duplicate SD collapses to a single (live) entry.
+    assert [s["event"] for s in merged] == ["SD", "AC"]
+    sd = merged[0]
+    assert sd["source"] == "live"
+    assert sd["phase"] == "Phase 3c - Destination Sequenced Carrier Sortation"
+    assert sd["machine"] == "DBCS-051"
+    assert sd["location"].startswith("WASHINGTON")
+    ac = merged[1]
+    assert ac["source"] == "stored"
+    assert ac["phase"] == "Phase 0 - Origin Processing"
+    assert ac["machine"] == "AFCS200-005"
+
+
+def test_merge_scan_sources_stored_only_when_no_live() -> None:
+    """With no live data, stored events still surface; ETA is None."""
+    from mailwatch.routes import _merge_scan_sources
+
+    stored = [{"event": {"scanEventCode": "AC"}, "scan_datetime": "2026-04-20T08:00:00+00:00"}]
+    merged, eta = _merge_scan_sources(None, stored)
+
+    assert eta is None
+    assert len(merged) == 1
+    assert merged[0]["event"] == "AC"
+    assert merged[0]["phase"] is None
+    assert merged[0]["machine"] is None

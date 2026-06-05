@@ -175,13 +175,20 @@ button.primary:hover, .button-link.primary:hover {
 .recent-status-in_transit { color: var(--accent); border-color: var(--accent); }
 .recent-status-awaiting { color: var(--muted); }
 
+.eta {
+  padding: 0.5rem 0.75rem; border: 1px solid var(--ok); border-radius: var(--radius);
+  background: var(--surface); color: var(--ok); font-weight: 500; font-size: 0.95rem;
+}
+
 .scans { list-style: none; padding: 0; margin: 0; }
 .scan {
   padding: 0.6rem 0.75rem; border: 1px solid var(--border);
   border-radius: var(--radius); margin-bottom: 0.5rem; background: var(--surface);
 }
+.scan-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2rem 0.5rem; }
 .scan-time { color: var(--muted); font-variant-numeric: tabular-nums; }
 .scan-event { font-weight: 500; }
+.scan-detail { margin-top: 0.2rem; color: var(--muted); font-size: 0.9rem; }
 .scan-location { color: var(--muted); }
 
 @media print {
