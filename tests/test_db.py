@@ -397,3 +397,110 @@ def test_purge_old_honors_custom_ttls(conn: sqlite3.Connection) -> None:
     assert deleted_default["scan_events"] == 0
     deleted_tight = db.purge_old(conn, scan_events_ttl_days=5)
     assert deleted_tight["scan_events"] == 1
+
+
+# --- recent tracked IMbs (tracking-page list) -------------------------------
+
+
+def test_recent_tracked_imbs_empty_db(conn: sqlite3.Connection) -> None:
+    assert db.recent_tracked_imbs(conn) == []
+
+
+def test_recent_tracked_imbs_newest_first_and_status(conn: sqlite3.Connection) -> None:
+    # Three letters with increasing created_at; expect newest first.
+    conn.execute(
+        "INSERT INTO tracked_imbs (imb, serial, recipient_zip, created_at) VALUES "
+        "('imb-old', 1001, '10009', 1000),"
+        "('imb-mid', 1002, '20002', 2000),"
+        "('imb-new', 1003, '30003', 3000)"
+    )
+    # imb-old delivered, imb-mid in transit, imb-new no scans yet.
+    _insert_scan(conn, "e-old", "imb-old", b'{"scanEventCode":"01"}', age_seconds=60)
+    _insert_scan(conn, "e-mid", "imb-mid", b'{"scanEventCode":"SD"}', age_seconds=60)
+
+    rows = db.recent_tracked_imbs(conn)
+    assert [r["serial"] for r in rows] == [1003, 1002, 1001]
+    by_serial = {r["serial"]: r for r in rows}
+    assert by_serial[1003]["status"] == "awaiting"
+    assert by_serial[1002]["status"] == "in_transit"
+    assert by_serial[1001]["status"] == "delivered"
+    assert by_serial[1003]["recipient_zip"] == "30003"
+
+
+def test_recent_tracked_imbs_status_uses_latest_scan(conn: sqlite3.Connection) -> None:
+    # An earlier delivery-looking-but-not code followed by a later delivery
+    # code must report "delivered"; ordering is by created_at then event_id.
+    db.register_imb(conn, "imb-x", 1001, "10009")
+    _insert_scan(conn, "e1", "imb-x", b'{"scanEventCode":"SD"}', age_seconds=120)
+    _insert_scan(conn, "e2", "imb-x", b'{"scanEventCode":"01"}', age_seconds=10)
+    rows = db.recent_tracked_imbs(conn)
+    assert rows[0]["status"] == "delivered"
+
+
+def test_recent_tracked_imbs_honours_limit(conn: sqlite3.Connection) -> None:
+    for i in range(5):
+        conn.execute(
+            "INSERT INTO tracked_imbs (imb, serial, recipient_zip, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (f"imb-{i}", 1000 + i, "10009", 1000 + i),
+        )
+    rows = db.recent_tracked_imbs(conn, limit=2)
+    assert [r["serial"] for r in rows] == [1004, 1003]
+
+
+def test_recent_tracked_imbs_omits_null_zip(conn: sqlite3.Connection) -> None:
+    # A null recipient_zip can't form a usable tracking link, so it's skipped.
+    db.register_imb(conn, "imb-null", 1001, None)
+    db.register_imb(conn, "imb-ok", 1002, "10009")
+    rows = db.recent_tracked_imbs(conn)
+    assert [r["serial"] for r in rows] == [1002]
+
+
+def test_register_imb_persists_name_and_company(conn: sqlite3.Connection) -> None:
+    db.register_imb(conn, "imb-x", 1001, "10009", "Jane Doe", "Acme Co")
+    rows = db.recent_tracked_imbs(conn)
+    assert rows[0]["recipient_name"] == "Jane Doe"
+    assert rows[0]["recipient_company"] == "Acme Co"
+
+
+def test_recent_tracked_imbs_name_company_default_none(conn: sqlite3.Connection) -> None:
+    # Letters registered without the metadata (e.g. pre-migration) surface None.
+    db.register_imb(conn, "imb-x", 1001, "10009")
+    rows = db.recent_tracked_imbs(conn)
+    assert rows[0]["recipient_name"] is None
+    assert rows[0]["recipient_company"] is None
+
+
+def test_migration_adds_name_company_to_legacy_table(tmp_path: Path) -> None:
+    """init_db backfills the new columns on a DB created with the old schema."""
+    c = db.connect(tmp_path / "legacy.db")
+    # Recreate the pre-metadata tracked_imbs shape, then seed a row.
+    c.executescript(
+        "CREATE TABLE tracked_imbs ("
+        "  imb TEXT PRIMARY KEY, serial INTEGER NOT NULL, recipient_zip TEXT,"
+        "  created_at INTEGER NOT NULL DEFAULT (unixepoch()));"
+    )
+    c.execute(
+        "INSERT INTO tracked_imbs (imb, serial, recipient_zip) VALUES ('imb-old', 1001, '10009')"
+    )
+    cols_before = {row[1] for row in c.execute("PRAGMA table_info(tracked_imbs)")}
+    assert "recipient_name" not in cols_before
+
+    db.init_db(c)  # idempotent create + migrate
+
+    cols_after = {row[1] for row in c.execute("PRAGMA table_info(tracked_imbs)")}
+    assert {"recipient_name", "recipient_company"} <= cols_after
+    # Existing row preserved; new columns read as NULL.
+    rows = db.recent_tracked_imbs(c)
+    assert rows[0]["serial"] == 1001
+    assert rows[0]["recipient_name"] is None
+    # New writes can populate the columns.
+    db.register_imb(c, "imb-new", 1002, "20002", "Jane Doe", "Acme Co")
+    by_serial = {r["serial"]: r for r in db.recent_tracked_imbs(c)}
+    assert by_serial[1002]["recipient_name"] == "Jane Doe"
+
+    # Re-running the migration is a no-op (no error, columns unchanged).
+    db.init_db(c)
+    cols_again = {row[1] for row in c.execute("PRAGMA table_info(tracked_imbs)")}
+    assert cols_again == cols_after
+    c.close()

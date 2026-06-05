@@ -37,10 +37,12 @@ CREATE TABLE IF NOT EXISTS serial_state (
 );
 
 CREATE TABLE IF NOT EXISTS tracked_imbs (
-    imb           TEXT PRIMARY KEY,
-    serial        INTEGER NOT NULL,
-    recipient_zip TEXT,
-    created_at    INTEGER NOT NULL DEFAULT (unixepoch())
+    imb               TEXT PRIMARY KEY,
+    serial            INTEGER NOT NULL,
+    recipient_zip     TEXT,
+    recipient_name    TEXT,
+    recipient_company TEXT,
+    created_at        INTEGER NOT NULL DEFAULT (unixepoch())
 );
 CREATE INDEX IF NOT EXISTS tracked_imbs_serial_idx ON tracked_imbs(serial);
 
@@ -96,8 +98,43 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """Create all tables and indexes if they don't exist. Idempotent."""
+    """Create all tables and indexes if they don't exist, then migrate.
+
+    Idempotent: safe to call on every startup against a fresh or existing DB.
+    """
     conn.executescript(SCHEMA)
+    _migrate(conn)
+
+
+def _add_columns_if_missing(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    """``ALTER TABLE ADD COLUMN`` for each column not already present.
+
+    ``columns`` maps column name to its SQL type declaration. Existing columns
+    are detected via ``PRAGMA table_info`` and skipped, so re-running is a
+    no-op. ``table``/column names come from internal callers only (never user
+    input) — ``PRAGMA`` and ``ALTER`` can't be parameterized, so they're
+    interpolated directly.
+    """
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, decl in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply idempotent additive migrations to an existing database.
+
+    ``CREATE TABLE IF NOT EXISTS`` only creates *missing* tables; it never adds
+    columns to a table that predates a schema change. New nullable columns are
+    therefore added here, so an older on-disk DB picks them up on next startup
+    without a destructive rebuild. Keep migrations additive and nullable —
+    Litestream replicates the resulting WAL frames like any other write.
+    """
+    _add_columns_if_missing(
+        conn,
+        "tracked_imbs",
+        {"recipient_name": "TEXT", "recipient_company": "TEXT"},
+    )
 
 
 # --- app_state K/V -----------------------------------------------------------
@@ -177,6 +214,8 @@ def register_imb(
     imb: str,
     serial: int,
     recipient_zip: str | None = None,
+    recipient_name: str | None = None,
+    recipient_company: str | None = None,
 ) -> bool:
     """Record a generated IMb so the poller can track it without a prior scan.
 
@@ -187,14 +226,72 @@ def register_imb(
     :func:`get_pollable_imbs` bootstrap a freshly mailed letter that has no
     scan event yet.
 
+    ``recipient_name`` / ``recipient_company`` are display-only metadata for
+    the tracking-page list (:func:`recent_tracked_imbs`); they play no part in
+    routing or IV-MTR keying.
+
     Idempotent via ``INSERT OR IGNORE`` on the IMb primary key. Returns True
     when a new row was inserted.
     """
     cur = conn.execute(
-        "INSERT OR IGNORE INTO tracked_imbs (imb, serial, recipient_zip) VALUES (?, ?, ?)",
-        (imb, serial, recipient_zip),
+        "INSERT OR IGNORE INTO tracked_imbs "
+        "(imb, serial, recipient_zip, recipient_name, recipient_company) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (imb, serial, recipient_zip, recipient_name, recipient_company),
     )
     return cur.rowcount > 0
+
+
+def recent_tracked_imbs(conn: sqlite3.Connection, limit: int = 20) -> list[dict[str, Any]]:
+    """Return the most recently registered letters for the tracking-page list.
+
+    Newest first (by ``created_at``, tiebreaking on ``serial`` so the order is
+    deterministic when several pieces in a batch share a timestamp). Each row
+    is enriched with a coarse ``status`` derived from its latest stored scan:
+
+    - ``"delivered"`` — latest scan carries a delivery code
+      (:data:`DELIVERED_SCAN_CODES`).
+    - ``"in_transit"`` — at least one scan exists but it isn't a delivery code.
+    - ``"awaiting"`` — no scan event has been recorded yet.
+
+    The status reflects only locally stored scans (what the poller/webhook have
+    persisted), not a live IV-MTR pull; the live pull happens when the operator
+    actually opens the letter via ``/track-ws``. Rows without a
+    ``recipient_zip`` are omitted — they can't form a usable tracking link.
+    ``recipient_name`` / ``recipient_company`` may be ``None`` for letters
+    registered before that metadata was captured.
+    """
+    rows = conn.execute(
+        "SELECT imb, serial, recipient_zip, recipient_name, recipient_company, created_at "
+        "FROM tracked_imbs "
+        "WHERE recipient_zip IS NOT NULL "
+        "ORDER BY created_at DESC, serial DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    result: list[dict[str, Any]] = []
+    for imb, serial, recipient_zip, recipient_name, recipient_company, created_at in rows:
+        latest = conn.execute(
+            "SELECT event_json FROM scan_events WHERE imb = ? "
+            "ORDER BY created_at DESC, event_id DESC LIMIT 1",
+            (imb,),
+        ).fetchone()
+        if latest is None:
+            status = "awaiting"
+        elif _is_delivered_payload(latest[0]):
+            status = "delivered"
+        else:
+            status = "in_transit"
+        result.append(
+            {
+                "serial": serial,
+                "recipient_zip": recipient_zip,
+                "recipient_name": recipient_name,
+                "recipient_company": recipient_company,
+                "created_at": created_at,
+                "status": status,
+            }
+        )
+    return result
 
 
 def get_imb_by_serial(conn: sqlite3.Connection, serial: int) -> str | None:

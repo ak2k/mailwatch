@@ -63,6 +63,16 @@ class Settings(BaseSettings):
     # IV-MTR pull-poll daemon (read by `python -m mailwatch.poll`)
     POLL_LOOKBACK_DAYS: int = Field(14, ge=1, le=365)
 
+    # Tracking page UX. When True, ``/tracking`` lists the most recently
+    # generated letters (serial + recipient ZIP + status) as clickable
+    # references so an operator need not retype the serial/ZIP from memory.
+    # The list exposes recipient ZIPs and serials to anyone who can reach
+    # the page (the site has no auth beyond the webhook IP gate), so set this
+    # to False on any deployment where /tracking is broadly reachable.
+    SHOW_RECENT_TRACKING: bool = Field(True)
+    # How many recent letters to surface in that list.
+    RECENT_TRACKING_LIMIT: int = Field(20, ge=1, le=100)
+
     # IV-MTR push feed source IP allowlist.
     # ``NoDecode`` disables pydantic-settings' default JSON-decoding for list
     # fields so the string form from env (``"a,b,c"``) reaches the

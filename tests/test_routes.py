@@ -673,6 +673,46 @@ def test_tracking_page_prefills(client: TestClient) -> None:
     assert 'value="20500"' in resp.text
 
 
+def test_tracking_page_lists_recent_generated(client: TestClient) -> None:
+    """A generated letter shows up in the recent-tracking list as a link."""
+    _submit_generate(client)
+    serial = client.app.state.db.execute("SELECT serial FROM tracked_imbs").fetchone()[0]
+
+    resp = client.get("/tracking")
+    assert resp.status_code == 200
+    assert "<h2>Recently generated</h2>" in resp.text
+    assert 'class="recent-list"' in resp.text
+    # Clickable reference that prefills the form on reload.
+    assert f"/tracking?serial={serial}&amp;zip=" in resp.text
+    assert f"#{serial}" in resp.text
+    # The captured recipient name is shown as the row's primary label.
+    assert "Mail Recipient" in resp.text
+    # No scan stored yet → coarse status is "Awaiting first scan".
+    assert "Awaiting first scan" in resp.text
+
+
+def test_tracking_page_recent_shows_company(client: TestClient) -> None:
+    """A recipient company captured at generate time appears in the list."""
+    _submit_generate(client, recipient_company="Acme Logistics Co")
+    resp = client.get("/tracking")
+    assert resp.status_code == 200
+    assert "Acme Logistics Co" in resp.text
+
+
+def test_tracking_page_recent_hidden_when_flag_off(client: TestClient) -> None:
+    """SHOW_RECENT_TRACKING=False suppresses the list even with letters on file."""
+    _submit_generate(client)
+    client.app.state.settings.SHOW_RECENT_TRACKING = False
+    try:
+        resp = client.get("/tracking")
+        assert resp.status_code == 200
+        # The list section is gone (the JS comment mentioning the heading is not).
+        assert "<h2>Recently generated</h2>" not in resp.text
+        assert 'class="recent-list"' not in resp.text
+    finally:
+        client.app.state.settings.SHOW_RECENT_TRACKING = True
+
+
 # --------------------------------------------------------------------------- #
 # WS /track-ws                                                                 #
 # --------------------------------------------------------------------------- #
