@@ -642,6 +642,7 @@ dependencies = [
     { name = "tenacity" },
     { name = "uvicorn" },
     { name = "weasyprint" },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -673,6 +674,7 @@ requires-dist = [
     { name = "tenacity", specifier = ">=9.0,<10" },
     { name = "uvicorn", specifier = ">=0.32,<1" },
     { name = "weasyprint", specifier = ">=63.0,<67" },
+    { name = "websockets", specifier = ">=14,<17" },
 ]
 
 [package.metadata.requires-dev]

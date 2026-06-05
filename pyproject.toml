@@ -20,6 +20,13 @@ classifiers = [
 dependencies = [
     "fastapi>=0.136,<1",
     "uvicorn>=0.32,<1",
+    # The /track-ws endpoint needs a WebSocket protocol backend at runtime.
+    # Bare `uvicorn` ships none (it lives in the `[standard]` extra), so under
+    # gunicorn's UvicornWorker every upgrade 404s with "No supported WebSocket
+    # library detected". Depend on `websockets` directly — lighter than the
+    # full `[standard]` extra (no uvloop/httptools/watchfiles) and all the
+    # worker actually needs to accept the upgrade.
+    "websockets>=14,<17",
     "gunicorn>=23.0,<24",
     "httpx>=0.28,<1",
     "tenacity>=9.0,<10",
