@@ -196,3 +196,22 @@ async def test_allowlist_rejects_unparseable_ip() -> None:
     assert starts and starts[0]["status"] == 403
     # App was never called because the middleware short-circuited.
     assert ("app", GATED_PATH) not in received
+
+
+def test_uvicorn_has_websocket_backend() -> None:
+    """Guard the /track-ws upgrade against a missing WebSocket backend.
+
+    Under gunicorn's ``UvicornWorker`` the WebSocket upgrade only works if a
+    protocol library (``websockets`` or ``wsproto``) is installed. Bare
+    ``uvicorn`` ships neither — they live in the ``uvicorn[standard]`` extra —
+    so without an explicit dependency the env builds fine, tests pass via
+    Starlette's in-process TestClient, and yet every live ``/track-ws`` 404s
+    with "No supported WebSocket library detected". This asserts the backend
+    is present so that regression can't ship silently again.
+    """
+    import importlib.util
+
+    assert importlib.util.find_spec("websockets") or importlib.util.find_spec("wsproto"), (
+        "no WebSocket backend (websockets/wsproto) installed — /track-ws will 404 "
+        "under uvicorn; add `websockets` to project dependencies"
+    )
