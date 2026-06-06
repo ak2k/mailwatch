@@ -27,7 +27,7 @@ dependencies = [
     # full `[standard]` extra (no uvloop/httptools/watchfiles) and all the
     # worker actually needs to accept the upgrade.
     "websockets>=14,<17",
-    "gunicorn>=23.0,<24",
+    "gunicorn>=26,<27",
     "httpx>=0.28,<1",
     "tenacity>=9.0,<10",
     "pydantic>=2.9,<3",
