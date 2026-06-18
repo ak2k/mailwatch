@@ -55,7 +55,7 @@ dev = [
     # handrolled IMb encoder against reportlab's USPS_4State. The
     # runtime uses WeasyPrint + USPSIMBStandard font for bar rendering,
     # not reportlab.
-    "reportlab>=4.2,<5",
+    "reportlab>=5,<6",
     # pypdf is dev-only: tests assert page counts on WeasyPrint output,
     # which is compressed so regex-based counting misses. pypdf reads
     # the object tree directly.
