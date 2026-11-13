@@ -59,7 +59,7 @@ dev = [
     # pypdf is dev-only: tests assert page counts on WeasyPrint output,
     # which is compressed so regex-based counting misses. pypdf reads
     # the object tree directly.
-    "pypdf>=5.0,<7",
+    "pypdf>=7.1,<8",
 ]
 
 # Optional: the backup browser-driven address resolver (mailwatch.web_lookup /
